@@ -1,0 +1,16 @@
+{
+    "compilerOptions": {
+      "module": "commonjs",
+      "target": "es2019",
+      "strict": true,
+      "rootDir": "src",
+      "outDir": "dist",
+      "esModuleInterop": true,
+      "skipLibCheck": true,
+  
+      "experimentalDecorators": true,
+      "emitDecoratorMetadata": true,
+      "useDefineForClassFields": false
+    },
+    "include": ["src"]
+  }
