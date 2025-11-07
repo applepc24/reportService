@@ -1,4 +1,5 @@
-import { Controller, Get, Query } from '@nestjs/common';
+// src/modules/report/report.controller.ts
+import { Controller, Get, Query, ParseIntPipe } from '@nestjs/common';
 import { ReportService } from './report.service';
 import { ReportResponse } from './report.types';
 
@@ -6,8 +7,12 @@ import { ReportResponse } from './report.types';
 export class ReportController {
   constructor(private readonly reportService: ReportService) {}
 
-  @Get()
-  getReport(@Query('dong') dong = '연남동'): ReportResponse {
-    return this.reportService.getReport(dong);
-  }
+  @Get('text')
+  async getReportWithText(
+    @Query('dongId', ParseIntPipe) dongId: number,
+  ): Promise<{ data: ReportResponse; text: string }> {
+    const data = await this.reportService.buildReport(dongId);
+    const text = await this.reportService.generateReportText(data);
+    return { data, text };
+}
 }
