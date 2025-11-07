@@ -1,19 +1,19 @@
 export interface ReportSummary {
-    pubCount: number;
-    avgRating: number | null;
-    reviews: number;
-  }
+  pubCount: number;
+  avgRating: number | null;
+  reviews: number;
+}
 
 export interface ReportTopPub {
-    name: string;
-    rating: number | null;
-    reviewCount: number;
-    }
+  name: string;
+  rating: number | null;
+  reviewCount: number;
+}
 
 export interface ReportMonthlyStat {
-    month: string;   // '2025-06-01'처럼 YYYY-MM-DD 문자열
-    reviews: number;
-  }
+  month: string; // '2025-06-01'처럼 YYYY-MM-DD 문자열
+  reviews: number;
+}
 
 export interface ReportDong {
   id: number;
@@ -22,8 +22,29 @@ export interface ReportDong {
 }
 
 export interface ReportResponse {
-    dong: ReportDong;
-    summary: ReportSummary;
-    topPubs: ReportTopPub[];
-    monthly: ReportMonthlyStat[];
-  }
+  dong: ReportDong;
+  summary: ReportSummary;
+  topPubs: ReportTopPub[];
+  monthly: ReportMonthlyStat[];
+}
+
+export interface AdviceOptions {
+  budgetLevel: string;
+  concept: string;
+  targetAge: string;
+  openHours?: string;
+}
+
+export interface AdviceRequest {
+  dongId: number;
+  budgetLevel: string;
+  concept: string;
+  targetAge: string;
+  openHours: string;
+  question: string;
+}
+
+export interface AdviceResponse {
+  report: ReportResponse;
+  advice: string;
+}
