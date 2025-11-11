@@ -21,11 +21,18 @@ export interface ReportDong {
   code?: string | null;
 }
 
+export interface TrafficSummary {
+  totalFootfall: number | null;
+  age20sRatio: number | null;
+  eveningRatio: number | null;
+}
+
 export interface ReportResponse {
   dong: ReportDong;
   summary: ReportSummary;
   topPubs: ReportTopPub[];
   monthly: ReportMonthlyStat[];
+  traffic?: TrafficSummary | null;
 }
 
 export interface AdviceOptions {
@@ -47,4 +54,11 @@ export interface AdviceRequest {
 export interface AdviceResponse {
   report: ReportResponse;
   advice: string;
+  places: AdvicePlace[];  // 🔹 카카오에서 가져온 장소들
+}
+
+export interface AdvicePlace {
+  name: string;
+  category: string;
+  url: string;
 }

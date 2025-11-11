@@ -4,6 +4,8 @@ import OpenAI from "openai";
 import { ConfigService } from "@nestjs/config";
 import { DongService } from "../dong/dong.service";
 import { PubService } from "../pub/pub.service";
+import { ReviewService } from "../review/review.service";
+import { TrafficService } from "../traffic/traffic.service";
 import {
   ReportResponse,
   ReportMonthlyStat,
@@ -19,6 +21,8 @@ export class ReportService {
   constructor(
     private readonly dongService: DongService,
     private readonly pubService: PubService,
+    private readonly reviewService: ReviewService,
+    private readonly trafficService: TrafficService,
     private readonly configService: ConfigService // 나중에 ReviewService, RAGService도 여기로 추가
   ) {
     const apiKey = this.configService.get<string>("OPENAI_API_KEY");
@@ -31,6 +35,54 @@ export class ReportService {
     }
 
     this.openai = new OpenAI({ apiKey });
+  }
+
+  /**
+   * 월별 리뷰 수 배열을 받아서
+   * "리뷰가 증가/감소/안정" 같은 한 줄 요약을 만들어준다.
+   */
+  private buildReviewTrendSummary(monthly: ReportMonthlyStat[]): string {
+    if (!monthly || monthly.length === 0) {
+      return "리뷰 추이 데이터를 확인할 수 없습니다.";
+    }
+
+    if (monthly.length === 1) {
+      return `데이터가 한 달 분만 있어, 리뷰 추세를 판단하기 어렵습니다. (해당 월 리뷰 수: ${monthly[0].reviews}건)`;
+    }
+
+    const first = monthly[0];
+    const last = monthly[monthly.length - 1];
+    const diff = last.reviews - first.reviews;
+
+    const peak = monthly.reduce(
+      (max, cur) => (cur.reviews > max.reviews ? cur : max),
+      monthly[0]
+    );
+
+    // 🔹 전체 리뷰 수가 너무 적으면 "추세"라고 부르지 말자
+    const total = monthly.reduce((sum, m) => sum + m.reviews, 0);
+    if (total < 30) {
+      return (
+        `월별 리뷰 데이터가 총 ${total}건으로 매우 적어, 뚜렷한 추세를 말하기는 어렵습니다. ` +
+        `가장 리뷰가 많았던 달은 ${peak.month}(${peak.reviews}건) 정도로 참고만 할 수 있는 수준입니다.`
+      );
+    }
+
+    let direction: string;
+    if (diff > 0) {
+      direction = "최근 몇 달 동안 리뷰 수가 증가하는 추세입니다.";
+    } else if (diff < 0) {
+      direction = "최근 몇 달 동안 리뷰 수가 감소하는 추세입니다.";
+    } else {
+      direction =
+        "최근 몇 달 동안 리뷰 수는 큰 변화 없이 비슷한 수준을 유지하고 있습니다.";
+    }
+
+    return [
+      direction,
+      `첫 달 리뷰 수: ${first.reviews}건, 마지막 달 리뷰 수: ${last.reviews}건.`,
+      `가장 리뷰가 많았던 달은 ${peak.month}로, 리뷰 ${peak.reviews}건을 기록했습니다.`,
+    ].join(" ");
   }
 
   // GET /report?dongId=1 에서 쓸 핵심 함수
@@ -61,8 +113,17 @@ export class ReportService {
     const reviews = pubs.map((p) => p.reviewCount).reduce((a, b) => a + b, 0);
 
     // 4) 월별 통계는 지금은 빈 배열 → 나중에 review 테이블 집계로 채울 예정
-    const monthly: ReportMonthlyStat[] = [];
+    const monthlyRaw = await this.reviewService.getMonthlyStatsByDong(dongId);
 
+    const monthly: ReportMonthlyStat[] = monthlyRaw.map((m) => ({
+      month: m.month, // 'YYYY-MM-01'
+      reviews: m.reviews,
+    }));
+
+    const trafficMetric = await this.trafficService.getLatestByDongName(
+      dong.name
+    );
+    const trafficSummary = this.trafficService.calcSummary(trafficMetric);
     // 5) 최종 ReportResponse 형태로 리턴
     return {
       dong: {
@@ -82,6 +143,7 @@ export class ReportService {
         reviewCount: p.reviewCount,
       })),
       monthly,
+      traffic: trafficSummary,
     };
   }
   async generateReportText(report: ReportResponse): Promise<string> {
@@ -147,15 +209,21 @@ ${reportJson}
   }
 
   async generateAdvice(
-    dongId: number,
+    report: ReportResponse,
     options: AdviceOptions,
     question: string
   ): Promise<string> {
     // 1) 먼저 JSON 리포트 만들기 (DB에서 데이터 수집)
-    const report = await this.buildReport(dongId);
-    const dongName = report.dong.name;
+    const { dong, summary, topPubs, monthly } = report;
+    const dongName = dong.name;
 
-    const reportJson = JSON.stringify(report, null, 2);
+    const reviewTrendSummary = this.buildReviewTrendSummary(monthly);
+
+    const reportJson = JSON.stringify(
+      { dong, summary, topPubs, monthly },
+      null,
+      2
+    );
     const optionsJson = JSON.stringify(options, null, 2);
 
     // 2) LLM에게 줄 system / user 프롬프트 구성
@@ -191,6 +259,9 @@ ${reportJson}
 [창업자 조건(JSON)]
 ${optionsJson}
 
+[월별 리뷰 추이 요약]
+${reviewTrendSummary}
+
 [창업자의 질문]
 ${question}
 
@@ -199,6 +270,7 @@ ${question}
 
 ## 상권 개요
 - 이 동네 술집 수, 평균 평점, 리뷰 수 등 핵심 숫자 요약
+- 위의 "월별 리뷰 추이 요약"을 자연스럽게 포함해서 설명
 
 ## 인기 술집/경쟁 구도
 - 상위 술집들의 공통점 (평점, 리뷰 수, 분위기 추정 등)

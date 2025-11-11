@@ -8,12 +8,16 @@ import {
   ParseIntPipe,
 } from "@nestjs/common";
 import { ReportService } from "./report.service";
+import { KakaoLocalService } from "../kakao/kakao-local.service";
 import { ReportResponse, AdviceResponse, AdviceRequest } from "./report.types";
 import { AdviceDto } from "./dto/advice.dto";
 
 @Controller("report")
 export class ReportController {
-  constructor(private readonly reportService: ReportService) {}
+  constructor(
+    private readonly reportService: ReportService,
+    private readonly kakaoLocalService: KakaoLocalService
+  ) {}
 
   @Get()
   async getReport(
@@ -36,7 +40,7 @@ export class ReportController {
     const report = await this.reportService.buildReport(body.dongId);
 
     const advice = await this.reportService.generateAdvice(
-      body.dongId,
+      report,
       {
         budgetLevel: body.budgetLevel,
         concept: body.concept,
@@ -45,7 +49,20 @@ export class ReportController {
       },
       body.question
     );
+    const keyword =
+    body.concept && body.concept.trim().length > 0
+      ? body.concept
+      : '술집';
 
-    return { report, advice };
+  const placesRaw = await this.kakaoLocalService.searchByDongAndKeyword(
+    report.dong.name, // 예: "연남동"
+    keyword,          // 예: "칵테일 바" or "술집"
+    5,                // 5개 정도만
+  );
+
+  // KakaoLocalService가 이미 { name, category, url } 형태로 돌려주니까
+  const places = placesRaw;
+
+    return { report, advice, places };
   }
 }
