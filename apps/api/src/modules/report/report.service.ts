@@ -6,12 +6,17 @@ import { DongService } from "../dong/dong.service";
 import { PubService } from "../pub/pub.service";
 import { ReviewService } from "../review/review.service";
 import { TrafficService } from "../traffic/traffic.service";
+import { StoreService } from "../store/store.service";
+import { KakaoLocalService } from "../kakao/kakao-local.service";
+import { TAChangeService } from "../ta_change/ta-change.service";
 import {
   ReportResponse,
   ReportMonthlyStat,
   AdviceResponse,
   AdviceOptions,
 } from "./report.types";
+import { SalesService } from "../sale/sales.service";
+import { FacilityService } from "../facility/facility.service";
 
 @Injectable()
 export class ReportService {
@@ -20,9 +25,12 @@ export class ReportService {
 
   constructor(
     private readonly dongService: DongService,
-    private readonly pubService: PubService,
-    private readonly reviewService: ReviewService,
     private readonly trafficService: TrafficService,
+    private readonly storeService: StoreService,
+    private readonly kakaoLocalService: KakaoLocalService,
+    private readonly taChangeService: TAChangeService,
+    private readonly salesService: SalesService,
+    private readonly facility: FacilityService,
     private readonly configService: ConfigService // 나중에 ReviewService, RAGService도 여기로 추가
   ) {
     const apiKey = this.configService.get<string>("OPENAI_API_KEY");
@@ -93,38 +101,56 @@ export class ReportService {
       throw new NotFoundException(`dong ${dongId} not found`);
     }
 
-    // 2) 이 동네 상위 술집 N개 가져오기
-    const pubs = await this.pubService.getTopPubsByDong(dongId, 5);
+    const dongCode = dong.code; // 예: '11440730'
+    const dongName = dong.name; // 예: '연남동'
 
-    // 3) summary 계산 (지금은 Top N 기준으로 임시 계산)
-    const pubCount = pubs.length;
+    // 2) 트래픽 + 점포 + 카카오 한 번에 병렬 호출
+    const [metric, storeSummary, kakaoPlaces, taMetric, salesSummary, facility] = await Promise.all([
+      dongCode ? this.trafficService.getLatestByDongCode(dongCode) : null,
+      dongCode ? this.storeService.getAlcoholSummaryByDongCode(dongCode) : null,
+      this.kakaoLocalService.searchPubsByDongName(dongName, { size: 5 }),
+      this.taChangeService.getLatestByDongCode(dong.code),
+      this.salesService.getLatestAlcoholSalesSummaryByDongCode(dongCode),
+      this.facility.getLatestSummaryByDongCode(dong.code),
+    ]);
 
-    const avgRating =
-      pubs.length > 0
-        ? Number(
-            (
-              pubs
-                .map((p) => Number(p.rating ?? 0))
-                .reduce((a, b) => a + b, 0) / pubs.length
-            ).toFixed(1)
-          )
-        : null;
+    // 3) 트래픽 요약 계산 (없으면 null)
+    const trafficSummary = metric
+      ? this.trafficService.calcSummary(metric)
+      : null;
 
-    const reviews = pubs.map((p) => p.reviewCount).reduce((a, b) => a + b, 0);
+    const taChange = taMetric
+      ? {
+          period: taMetric.period,
+          index: taMetric.changeIndex,
+          indexName: taMetric.changeIndexName,
+          opRunMonthAvg: taMetric.opRunMonthAvg,
+          clRunMonthAvg: taMetric.clRunMonthAvg,
+          seoulOpRunMonthAvg: taMetric.seoulOpRunMonthAvg,
+          seoulClRunMonthAvg: taMetric.seoulClRunMonthAvg,
+        }
+      : null;
 
-    // 4) 월별 통계는 지금은 빈 배열 → 나중에 review 테이블 집계로 채울 예정
-    const monthlyRaw = await this.reviewService.getMonthlyStatsByDong(dongId);
-
-    const monthly: ReportMonthlyStat[] = monthlyRaw.map((m) => ({
-      month: m.month, // 'YYYY-MM-01'
-      reviews: m.reviews,
+    // 4) 카카오 결과를 우리가 쓰기 쉬운 구조로 변환
+    const kakaoPubs = kakaoPlaces.map((p) => ({
+      name: p.placeName,
+      category: p.categoryName,
+      url: p.placeUrl,
     }));
 
-    const trafficMetric = await this.trafficService.getLatestByDongName(
-      dong.name
-    );
-    const trafficSummary = this.trafficService.calcSummary(trafficMetric);
-    // 5) 최종 ReportResponse 형태로 리턴
+    // 5) 프론트에서 보여줄 “요약” 숫자들
+    const pubCount = storeSummary?.totalStoreCount ?? 0;
+
+    // 지금은 별점/리뷰가 없으니까 null/0
+    const avgRating = null;
+    const reviews = 0;
+
+    const topPubs = kakaoPubs.map((p) => ({
+      name: p.name,
+      rating: null,
+      reviewCount: 0,
+    }));
+
     return {
       dong: {
         id: dong.id,
@@ -136,119 +162,218 @@ export class ReportService {
         avgRating,
         reviews,
       },
-      topPubs: pubs.map((p) => ({
-        name: p.name,
-        rating:
-          p.rating !== null && p.rating !== undefined ? Number(p.rating) : null,
-        reviewCount: p.reviewCount,
-      })),
-      monthly,
+      topPubs,
+      monthly: [], // 리뷰 DB 붙이면 여기 채우자
       traffic: trafficSummary,
+      store: storeSummary,
+      kakaoPubs,
+      taChange,
+      sales: salesSummary
+        ? {
+            period: salesSummary.period,
+            totalAmt: salesSummary.totalAmt,
+            weekendRatio: salesSummary.weekendRatio,
+            peakTimeSlot: salesSummary.peakTimeSlot,
+          }
+        : null,
+      facility,
     };
   }
+  // src/modules/report/report.service.ts 안에서
+
   async generateReportText(report: ReportResponse): Promise<string> {
     const reportJson = JSON.stringify(report, null, 2);
-    const dongName = report.dong.name;
 
-    const systemPrompt = `
-너는 서울 동네 술집 창업 컨설턴트야.
-아래 JSON 데이터를 기반으로,
-1인 창업자가 이해하기 쉬운 한국어 리포트를 써줘.
-
-규칙:
-- JSON에 없는 정보는 지어내지 말 것
-- 동 이름, 요약, 상위 술집 특징, 리뷰/평점의 느낌을 설명
-- 너무 길지 않게, 4~6개의 문단으로 정리
-`;
-
-    const userPrompt = `
-다음은 특정 행정동에 대한 술집 데이터야.
-이 데이터를 기반으로 창업자를 위한 분석 리포트를 작성해줘.
-
-JSON:
-${reportJson}
-`;
-
-    const completion = await this.openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `
-너는 서울 각 행정동의 술집 상권을 분석하는 데이터 리포트 작성 전문가야.
-출력은 반드시 **한국어 마크다운(Markdown)** 형식으로 작성해.
-- 제목과 섹션은 #, ## 로 구분
-- 리스트는 - 로 작성
-- 표는 Markdown 테이블로 표현
-- 숫자, 비율, 추세를 명확하게 서술
-
-리포트 구성 예시는 다음과 같아:
-## 상권 개요
-## 인기 술집 TOP 3
-## 소비자 리뷰 요약
-## 가격 및 경쟁 전략
-## 리스크 & 기회
-## 요약 결론
-`,
-        },
-        {
-          role: "user",
-          content: `
-          다음 JSON 데이터를 기반으로 "${dongName}" 행정동의 술집 상권 분석 리포트를 작성해줘.
-          가능하다면 수치를 요약해서 트렌드를 설명해줘.
-          1인 술집 창업자가 이해하기 쉬운 언어로 작성해줘.
-
-          JSON:
-          ${reportJson}
-`,
-        },
-      ],
-    });
-
-    return completion.choices[0]?.message?.content ?? "";
-  }
-
-  async generateAdvice(
-    report: ReportResponse,
-    options: AdviceOptions,
-    question: string
-  ): Promise<string> {
-    // 1) 먼저 JSON 리포트 만들기 (DB에서 데이터 수집)
-    const { dong, summary, topPubs, monthly } = report;
-    const dongName = dong.name;
-
-    const reviewTrendSummary = this.buildReviewTrendSummary(monthly);
-
-    const reportJson = JSON.stringify(
-      { dong, summary, topPubs, monthly },
-      null,
-      2
-    );
-    const optionsJson = JSON.stringify(options, null, 2);
-
-    // 2) LLM에게 줄 system / user 프롬프트 구성
     const completion = await this.openai.chat.completions.create({
       model: this.modelName,
       messages: [
         {
           role: "system",
           content: `
-너는 서울 각 행정동의 술집 상권을 분석해서
-1인 창업자에게 조언을 해주는 컨설턴트야.
+너는 서울 각 행정동의 상권 데이터를 해석해서
+술집/요식업 1인 창업자를 위한 분석 리포트를 써주는 컨설턴트야.
 
-- 출력은 반드시 **한국어 마크다운(Markdown)** 으로 작성해.
-- 제목과 섹션은 ##, ### 를 사용해라.
-- 리스트는 - 를 사용해라.
-- JSON에 없는 사실은 절대 지어내지 말 것.
-- 숫자(평점, 리뷰 수, 상위 술집 특성)를 적극적으로 활용해 트렌드를 설명해라.
+반드시 다음 규칙을 지켜라:
 
-JSON 상권 데이터에 연령대나 컨셉 관련 수치(예: 연령대 비율, 업종별 비중 등)가 없는 경우:
+1) **출력 형식**
+- 반드시 한국어로 작성한다.
+- 마크다운(Markdown) 형식을 사용한다.
+- 제목과 섹션은 #, ##, ### 를 사용한다.
+- 목록은 - 또는 1. 2. 형식으로 사용한다.
 
-- "데이터 기준으로는 연령 분포/컨셉 트렌드 정보가 부족합니다."라고 분명히 밝힌다.
-- 연령대 비율, 트렌드, 정확한 숫자는 추측해서 만들지 않는다.
-- 대신, 일반적인 창업 컨설팅 경험에 기반한 조언(예: 20-30대를 타깃으로 할 때 보통 유효한 전략)을
-  이 창업자의 조건(budgetLevel, concept, targetAge 등)에 맞춰 제안한다.
-          `.trim(),
+2) **데이터 사용 원칙**
+- 아래 JSON 안에 있는 숫자/사실만 기반으로 분석한다.
+- JSON에 없는 구체적인 숫자(예: 매출액, 임대료 수준, 정확한 인구 수 등)는 지어내지 않는다.
+- JSON에 없는 항목은 "데이터 기준으로는 ○○ 정보가 부족합니다." 라고 분명히 밝힌다.
+- 숫자를 말할 때는 가능한 한 JSON의 필드를 참고해서 "대략적인 경향"을 서술한다.
+
+3) **JSON 필드 설명**
+- report.dong: { name, code } => 행정동 이름과 코드
+- report.summary:
+  - pubCount: 술집/유관 업종 점포 수
+  - avgRating, reviews: (지금은 거의 사용 안 됨, null일 수 있음)
+- report.traffic (없을 수도 있음):
+  - totalFootfall: 해당 기간 유동 인구 총합
+  - maleRatio, femaleRatio: 성비 비율 (0~1)
+  - age20_30Ratio: 20~30대 비율 (0~1)
+  - peakTimeSlot: 유동 인구가 가장 많은 시간대 (예: "17-21")
+- report.store (없을 수도 있음):
+  - totalStoreCount: 술집 관련 점포 수
+  - openRate, closeRate: 창·폐업 비율 (0~1)
+  - franchiseRatio: 프랜차이즈 비중 (0~1)
+- report.kakaoPubs: 카카오 장소 검색으로 가져온 실제 술집 후보 (name, category, url)
+
+4) **레포트 구성 예시**
+아래 섹션 구조를 기본 골격으로 사용해라. 필요하면 약간 변형해도 되지만, 전반적인 흐름은 유지한다.
+
+# {행정동 이름} 술집 상권 리포트
+
+## 1. 상권 개요
+- 이 동네의 술집 수, 유동 인구 규모, 대략적인 분위기 요약
+- 유동 인구와 점포 수를 함께 언급해서 "상대적으로 붐비는 편인지" 해석
+
+## 2. 유동 인구 & 타깃 고객 분석
+- 성비(maleRatio, femaleRatio)
+- 20~30대 비중(age20_30Ratio)
+- 가장 붐비는 시간대(peakTimeSlot)
+- 야간 중심인지, 주간 생활권인지 등 "느낌"을 설명
+- traffic 데이터가 없으면 데이터 부족을 명시
+
+## 3. 술집·경쟁 상황
+- totalStoreCount, openRate, closeRate, franchiseRatio를 활용해서
+  - 경쟁 점포 수
+  - 폐업 비율이 높은지/낮은지
+  - 프랜차이즈 비중이 높은지/개인 점포 위주인지
+- store 데이터가 없으면, "점포 데이터 부족"을 언급하고 추측은 하지 말 것
+
+## 4. 실제 술집 예시
+- kakaoPubs 리스트를 최대 5개 정도 bullet로 나열
+  - 가게 이름, 카테고리, URL을 간단히 보여주고
+  - 이 동네에서 어떤 스타일 가게가 이미 자리 잡고 있는지 설명
+- kakaoPubs가 비어 있으면 "카카오 장소 검색 결과가 부족"하다고 언급
+
+## 5. 종합 인사이트 요약
+- 위의 내용을 기반으로, 이 동네 술집 상권의 장점/리스크를 짧게 정리
+- 창업자가 이 동네를 고려할 때 핵심적으로 봐야 할 포인트 3~5개를 bullet로 정리
+
+5) **톤**
+- 너무 가볍지 않게, 실제 컨설팅 리포트처럼 진지하지만 친절한 톤으로 작성한다.
+- "~일 수 있습니다." / "~로 보입니다." 처럼 가설형 표현을 사용해라.
+        `.trim(),
+        },
+        {
+          role: "user",
+          content: `
+다음은 특정 행정동의 상권 데이터(JSON)야.
+이 데이터를 기반으로 상권 분석 리포트를 작성해줘.
+
+JSON 데이터:
+${reportJson}
+        `.trim(),
+        },
+      ],
+    });
+
+    return completion.choices[0]?.message?.content?.trim() ?? "";
+  }
+
+  // src/modules/report/report.service.ts 안에서
+
+  async generateAdvice(
+    report: ReportResponse,
+    options: AdviceOptions,
+    question: string
+  ): Promise<string> {
+    const reportJson = JSON.stringify(report, null, 2);
+    const optionsJson = JSON.stringify(options, null, 2);
+    const kakaoPubs = report.kakaoPubs ?? [];
+
+    const kakaoListText =
+      kakaoPubs.length > 0
+        ? kakaoPubs
+            .map((p, idx) => `${idx + 1}. ${p.name} (${p.category}) - ${p.url}`)
+            .join("\n")
+        : "해당 동네에서 카카오 API로 찾은 술집 정보가 충분하지 않습니다.";
+
+    const safeQuestion =
+      question && question.trim().length > 0
+        ? question
+        : "제가 이 동네에 1인 술집을 창업한다고 생각하고, 상권 특성과 제 조건을 고려한 현실적인 조언을 해주세요.";
+
+    const completion = await this.openai.chat.completions.create({
+      model: this.modelName,
+      messages: [
+        {
+          role: "system",
+          content: `
+너는 서울 상권을 잘 아는 **술집/요식업 1인 창업 컨설턴트**야.
+
+역할:
+- 주어진 상권 데이터(JSON)과 창업자 조건(JSON)을 기반으로
+- "내가 이 동네에 가게를 내면 어떤 포지셔닝과 전략이 좋을지"를 설명해주는 역할이다.
+
+반드시 지킬 규칙:
+
+1) **출력 형식**
+- 한국어, 마크다운(Markdown).
+- 제목은 ##, 소제목은 ### 를 사용해라.
+- 문단 + bullet 조합으로 읽기 쉽게 작성해라.
+
+2) **데이터 사용 원칙**
+- 주어진 JSON(report, options) 안에 없는 구체 숫자는 만들지 않는다.
+  - 예: 임대료 xx만원, 예상 매출 xx만원, 정확한 인구 수 등은 추측해서 작성하지 X.
+- 대신 "상대적으로 많다/적다", "비율이 높은 편이다" 처럼 경향 위주로 설명한다.
+- traffic, store, kakaoPubs 등이 null 이거나 비어 있으면
+  - "데이터 기준으로는 ○○ 정보가 부족합니다." 를 먼저 말해주고
+  - 그 뒤에 일반적인 업계 경험에 기반한 조언을 한다.
+
+3) **JSON 필드 개념**
+- report.dong: 행정동 이름/코드
+- report.summary: 술집 수(pubCount) 등 요약
+- report.traffic: 유동 인구 규모/구성 (없을 수 있음)
+- report.store: 술집 점포 수, 프랜차이즈 비중, 폐업률 등 (없을 수 있음)
+- report.kakaoPubs: 그 동네 실제 술집 예시 리스트
+
+- options (창업자 조건):
+  - budgetLevel: 예산 수준 (예: "low", "mid", "high" 또는 한국어로 들어올 수도 있음)
+  - concept: 가게 컨셉 (예: "조용한 와인바", "스포츠 펍")
+  - targetAge: 타깃 연령대 (예: "20대", "20-30대 직장인")
+  - openHours: 운영 시간 (예: "퇴근 후~새벽", "저녁 6시~자정")
+
+4) **답변 구성 가이드**
+가능하면 아래 섹션 구조를 따라라:
+
+## 1. 상권 요약 & 질문 재해석
+- 이 동네 상권의 핵심 키워드를 2~3줄로 요약
+- 사용자의 질문을 한 줄로 다시 정리 ("당신의 질문은 결국 ○○에 대한 고민입니다" 식으로)
+
+## 2. 상권 vs 내 컨셉 적합도
+- traffic / store / kakaoPubs 데이터를 기준으로
+  - 현재 상권의 고객 흐름, 경쟁 강도, 기존 가게 스타일을 설명
+- options.concept, options.targetAge 와 어떻게 맞는지 / 안 맞는지 분석
+
+## 3. 입지 & 포지셔닝 전략
+- 이 동에서 창업자가 어떤 포지션을 잡으면 좋을지
+  - 예: 조용한 바 vs 시끄러운 펍, 가성비 vs 프리미엄, 술 위주 vs 안주 강한 집 등
+- 예산 수준(budgetLevel)에 따라 인테리어/메뉴/규모를 어떻게 조정하면 좋을지
+
+## 4. 운영 전략 (시간대, 메뉴, 마케팅)
+- openHours, peakTimeSlot(traffic 기준)을 엮어서
+  - 언제 집중 운영해야 할지
+  - 어떤 시간대에 프로모션/이벤트를 하면 좋을지
+- targetAge에 맞는 메뉴/가격대/마케팅 채널(인스타, 네이버 등) 제안
+
+## 5. 리스크 & 체크리스트
+- 이 상권에서 특히 조심해야 할 포인트 3~5개
+- 창업자가 최종 결정을 내리기 전에 꼭 확인해야 할 체크리스트
+
+## 6. 한 줄 총평
+- 이 창업자에게 해주고 싶은 핵심 한 줄 조언
+
+5) **톤**
+- "현실적인데 따뜻한 선배 사장님" 느낌으로 조언해라.
+- 지나치게 긍정적이거나 부정적이지 말고, 데이터와 조건을 기반으로 솔직하게 말해라.
+        `.trim(),
         },
         {
           role: "user",
@@ -259,39 +384,29 @@ ${reportJson}
 [창업자 조건(JSON)]
 ${optionsJson}
 
-[월별 리뷰 추이 요약]
-${reviewTrendSummary}
+[주변 실제 술집 예시 (카카오 API 결과)]
+${kakaoListText}
 
 [창업자의 질문]
-${question}
+${safeQuestion}
 
-위 데이터를 기반으로 **"${dongName}" 행정동**에서 술집을 창업하려는 1인 창업자를 위해
-아래 구조로 리포트를 작성해줘.
+위 정보를 기반으로 **"${report.dong.name}" 행정동** 상권 분석과 창업 조언을 아래 구조로 작성해줘.
 
-## 상권 개요
-- 이 동네 술집 수, 평균 평점, 리뷰 수 등 핵심 숫자 요약
-- 위의 "월별 리뷰 추이 요약"을 자연스럽게 포함해서 설명
+1. 상권 요약 & 질문 재해석
+2. 상권 vs 내 컨셉 적합도
+3. 입지 & 포지셔닝 전략
+4. 운영 전략 (시간대, 메뉴, 마케팅)
+5. 리스크 & 체크리스트
+6. 주변 실제 술집 이름, url
+6. 한 줄 총평
 
-## 인기 술집/경쟁 구도
-- 상위 술집들의 공통점 (평점, 리뷰 수, 분위기 추정 등)
-- 예산/컨셉/타깃 연령을 기준으로 이 창업자가 어디에 포지셔닝하면 좋을지
-
-## 가격 및 운영 전략
-- 예산 수준(budgetLevel)을 고려해서 현실적인 가격대/운영 전략 제안
-
-## 리스크 & 기회
-- 이 상권에서 조심해야 할 점
-- 이 창업자의 조건에서 활용할 수 있는 기회
-
-## 한 줄 요약 조언
-- 이 창업자에게 주는 핵심 한 줄 조언
-          `.trim(),
+가능하다면 위의 [주변 실제 술집 예시]도 참고해서
+경쟁 구도, 포지셔닝, 리스크를 언급해줘.
+        `.trim(),
         },
       ],
     });
 
-    const adviceText = completion.choices[0]?.message?.content ?? "";
-
-    return adviceText;
+    return completion.choices[0]?.message?.content?.trim() ?? "";
   }
 }

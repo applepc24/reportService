@@ -5,6 +5,15 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { TrafficMetric } from './entities/traffic-metric.entity';
 
+export interface TrafficSummary {
+  period: string;          // '20251' 같은 분기 코드
+  totalFootfall: number;   // 총 유동 인구
+  maleRatio: number;       // 0~1
+  femaleRatio: number;     // 0~1
+  age20_30Ratio: number;   // 0~1 (20대+30대 비율)
+  peakTimeSlot: string;    // '17-21' 이런 식으로
+}
+
 @Injectable()
 export class TrafficService {
   private readonly logger = new Logger(TrafficService.name);
@@ -116,27 +125,75 @@ export class TrafficService {
     return inserted;
   }
 
-  async getLatestByDongName(dongName: string): Promise<TrafficMetric | null> {
+  async getLatestByDongCode(dongCode: string): Promise<TrafficMetric | null> {
     return this.trafficRepo.findOne({
-      where: { dongName },
-      order: { period: 'DESC' },
+      where: { dongCode },
+      order: {
+        period: 'DESC',  // '20251' > '20241' 이런 식으로
+        id: 'DESC',      // 동일 period 안에서 가장 나중에 들어온 것
+      },
     });
   }
   
-  calcSummary(metric: TrafficMetric | null) {
-    if (!metric) return null;
-  
-    const total = Number(metric.totalFootfall ?? 0);
-    if (total === 0) return null;
-  
-    const age20 = Number(metric.age20 ?? 0);
-    const evening =
-      Number(metric.tm17_21 ?? 0) + Number(metric.tm21_24 ?? 0);
-  
+  calcSummary(metric: TrafficMetric): TrafficSummary {
+    const {
+      period,
+      totalFootfall,
+      maleFootfall,
+      femaleFootfall,
+      age10,
+      age20,
+      age30,
+      age40,
+      age50,
+      age60Plus,
+      tm00_06,
+      tm06_11,
+      tm11_14,
+      tm14_17,
+      tm17_21,
+      tm21_24,
+    } = metric;
+
+    const total = Number(totalFootfall) || 0;
+    const male = Number(maleFootfall) || 0;
+    const female = Number(femaleFootfall) || 0;
+
+    const age20_30 =
+      (Number(age20) || 0) +
+      (Number(age30) || 0);
+
+    const maleRatio = total > 0 ? male / total : 0;
+    const femaleRatio = total > 0 ? female / total : 0;
+    const age20_30Ratio = total > 0 ? age20_30 / total : 0;
+
+    // 시간대별 중에서 가장 큰 값 찾아서 label 뽑기
+    const slots = [
+      { key: '00-06', value: Number(tm00_06) || 0 },
+      { key: '06-11', value: Number(tm06_11) || 0 },
+      { key: '11-14', value: Number(tm11_14) || 0 },
+      { key: '14-17', value: Number(tm14_17) || 0 },
+      { key: '17-21', value: Number(tm17_21) || 0 },
+      { key: '21-24', value: Number(tm21_24) || 0 },
+    ];
+
+    let peakTimeSlot = '';
+    let maxVal = -1;
+
+    for (const s of slots) {
+      if (s.value > maxVal) {
+        maxVal = s.value;
+        peakTimeSlot = s.key;
+      }
+    }
+
     return {
+      period,
       totalFootfall: total,
-      age20sRatio: Number((age20 / total).toFixed(3)),
-      eveningRatio: Number((evening / total).toFixed(3)),
+      maleRatio,
+      femaleRatio,
+      age20_30Ratio,
+      peakTimeSlot,
     };
   }
 }

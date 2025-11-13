@@ -1,3 +1,5 @@
+
+
 export interface ReportSummary {
   pubCount: number;
   avgRating: number | null;
@@ -22,10 +24,56 @@ export interface ReportDong {
 }
 
 export interface TrafficSummary {
-  totalFootfall: number | null;
-  age20sRatio: number | null;
-  eveningRatio: number | null;
+  period: string;
+  totalFootfall: number;
+  maleRatio: number;
+  femaleRatio: number;
+  age20_30Ratio: number;
+  peakTimeSlot: string;
 }
+
+export interface StoreSummary {
+  dongCode: string;
+  totalStoreCount: number;
+  openStoreCount: number;
+  closeStoreCount: number;
+  franchiseStoreCount: number;
+  openRate: number;
+  closeRate: number;
+  franchiseRatio: number;
+}
+
+export interface KakaoPub {
+  name: string;
+  category: string;
+  url: string;
+}
+
+export interface TAChangeSummary {
+  period: string;
+  index: 'LL' | 'LH' | 'HL' | 'HH' | null;// TRDAR_CHNGE_IX
+  indexName: string | null;   // TRDAR_CHNGE_IX_NM (예: 성장/쇠퇴/…)
+  opRunMonthAvg?: number | null;
+  clRunMonthAvg?: number | null;
+  seoulOpRunMonthAvg?: number | null;
+  seoulClRunMonthAvg?: number | null;
+}
+
+export interface SalesSection {
+  period: string;
+  totalAmt: number;
+  weekendRatio: number;   // 0~1
+  peakTimeSlot: string;   // '17-21'
+}
+
+export type FacilitySummary = {
+  period: string;
+  viatrFacilityCount: number;
+  universityCount: number;
+  subwayStationCount: number;
+  busStopCount: number;
+  bankCount: number;
+};
 
 export interface ReportResponse {
   dong: ReportDong;
@@ -33,6 +81,11 @@ export interface ReportResponse {
   topPubs: ReportTopPub[];
   monthly: ReportMonthlyStat[];
   traffic?: TrafficSummary | null;
+  store?: StoreSummary | null;
+  kakaoPubs?: KakaoPub[];
+  taChange?: TAChangeSummary | null;
+  sales?: SalesSection | null;
+  facility?: FacilitySummary | null;
 }
 
 export interface AdviceOptions {
@@ -54,7 +107,7 @@ export interface AdviceRequest {
 export interface AdviceResponse {
   report: ReportResponse;
   advice: string;
-  places: AdvicePlace[];  // 🔹 카카오에서 가져온 장소들
+  places: AdvicePlace[];
 }
 
 export interface AdvicePlace {

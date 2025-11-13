@@ -6,7 +6,10 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "build": "tsc",
-    "start": "node dist/main.js"
+    "start": "node dist/main.js",
+    "typeorm": "typeorm-ts-node-commonjs -d src/database/data-source.ts",
+    "migration:generate": "npm run typeorm -- migration:generate src/migrations/CreateTaChangeMetrics",
+    "migration:run": "npm run typeorm -- migration:run"
   },
   "keywords": [],
   "author": "",

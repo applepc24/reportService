@@ -5,6 +5,17 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { StoreMetric } from './entities/store_metric.entity';
 
+export interface StoreSummary {
+  dongCode: string;
+  totalStoreCount: number;
+  openStoreCount: number;
+  closeStoreCount: number;
+  franchiseStoreCount: number;
+  openRate: number;        // 0~1
+  closeRate: number;       // 0~1
+  franchiseRatio: number;  // 0~1
+}
+
 
 @Injectable()
 export class StoreService {
@@ -107,5 +118,60 @@ export class StoreService {
       `✅ Done importing store rows for period=${period}, totalInserted=${totalInserted}`,
     );
     return totalInserted;
+  }
+
+  async getAlcoholSummaryByDongCode(
+    dongCode: string,
+  ): Promise<StoreSummary | null> {
+    // 가장 최신 period 하나 찾기
+    const latest = await this.storeRepo.findOne({
+      where: { dongCode },
+      order: {
+        period: 'DESC',
+        id: 'DESC',
+      },
+    });
+
+    if (!latest) {
+      return null;
+    }
+
+    const period = latest.period;
+
+    // 해당 period + dongCode 에 대해 전체 합계 계산
+    const row = await this.storeRepo
+      .createQueryBuilder('s')
+      .select('SUM(s.storeCount)', 'totalStoreCount')
+      .addSelect('SUM(s.openStoreCount)', 'openStoreCount')
+      .addSelect('SUM(s.closeStoreCount)', 'closeStoreCount')
+      .addSelect('SUM(s.franchiseStoreCount)', 'franchiseStoreCount')
+      .where('s.dongCode = :dongCode', { dongCode })
+      .andWhere('s.period = :period', { period })
+      .getRawOne<{
+        totalStoreCount: string | null;
+        openStoreCount: string | null;
+        closeStoreCount: string | null;
+        franchiseStoreCount: string | null;
+      }>();
+
+    if (!row || row.totalStoreCount === null) {
+      return null;
+    }
+
+    const total = Number(row.totalStoreCount) || 0;
+    const open = Number(row.openStoreCount) || 0;
+    const close = Number(row.closeStoreCount) || 0;
+    const franchise = Number(row.franchiseStoreCount) || 0;
+
+    return {
+      dongCode,
+      totalStoreCount: total,
+      openStoreCount: open,
+      closeStoreCount: close,
+      franchiseStoreCount: franchise,
+      openRate: total > 0 ? open / total : 0,
+      closeRate: total > 0 ? close / total : 0,
+      franchiseRatio: total > 0 ? franchise / total : 0,
+    };
   }
 }

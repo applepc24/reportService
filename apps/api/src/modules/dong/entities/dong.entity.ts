@@ -1,6 +1,6 @@
-import { Entity, Column, PrimaryGeneratedColumn } from 'typeorm';
+import { Entity, Column, PrimaryGeneratedColumn } from "typeorm";
 
-@Entity('dong') // ✅ 실제 테이블 이름
+@Entity("dong") // ✅ 실제 테이블 이름
 export class Dong {
   @PrimaryGeneratedColumn()
   id!: number;
@@ -8,6 +8,6 @@ export class Dong {
   @Column()
   name!: string;
 
-  @Column({ nullable: true })
-  code?: string;
+  @Column({ type: "varchar", length: 10, nullable: false, unique: true })
+  code!: string;
 }

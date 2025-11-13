@@ -8,6 +8,7 @@ import { ReviewModule } from './modules/review/review.module';
 import { TrafficMetric } from './modules/traffic/entities/traffic-metric.entity';
 import { TrafficModule } from './modules/traffic/traffic.module';
 import { StoreModule } from './modules/store/store.module';
+import { SalesModule } from './modules/sale/sale.module';
 
 @Module({
   imports: [
@@ -21,7 +22,8 @@ import { StoreModule } from './modules/store/store.module';
     ReviewModule,
     TrafficMetric,
     TrafficModule,
-    StoreModule
+    StoreModule,
+    SalesModule,
   ],
 })
 export class AppModule {}

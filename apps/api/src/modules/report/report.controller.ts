@@ -60,8 +60,11 @@ export class ReportController {
     5,                // 5개 정도만
   );
 
-  // KakaoLocalService가 이미 { name, category, url } 형태로 돌려주니까
-  const places = placesRaw;
+  const places = placesRaw.map((p) => ({
+    name: p.placeName,
+    category: p.categoryName,
+    url: p.placeUrl,
+  }));
 
     return { report, advice, places };
   }
