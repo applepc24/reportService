@@ -3,6 +3,7 @@ import axios from "axios";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 import { SalesMetric } from "./entities/sales_metric.entity";
+import { DataSource } from 'typeorm';
 
 export interface SalesSummary {
   period: string;
@@ -19,7 +20,8 @@ export class SalesService {
 
   constructor(
     @InjectRepository(SalesMetric)
-    private readonly repo: Repository<SalesMetric>
+    private readonly repo: Repository<SalesMetric>,
+    private readonly dataSource: DataSource,
   ) {}
 
   private toBigintString(v: any): string {
@@ -252,5 +254,9 @@ export class SalesService {
       weekendRatio: totalAmt > 0 ? wkendAmt / totalAmt : 0,
       peakTimeSlot,
     };
+  }
+
+  async refreshDongQuarterView(): Promise<void> {
+    await this.dataSource.query('REFRESH MATERIALIZED VIEW mv_dong_quarter');
   }
 }
