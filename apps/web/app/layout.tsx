@@ -1,28 +1,31 @@
-import type { Metadata } from 'next';
-import React from 'react';
+import type { Metadata } from "next";
+import { Inter } from "next/font/google";
+import "./globals.css";
+import { ThemeProvider } from "next-themes";
+
+const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: 'PubInsight Seoul',
-  description: '동네 술집 상권 리포트',
+  title: "Snap Report Wizard",
+  description: "Report generation wizard",
 };
 
 export default function RootLayout({
   children,
-}: {
+}: Readonly<{
   children: React.ReactNode;
-}) {
+}>) {
   return (
-    <html lang="ko">
-      <body
-        style={{
-          margin: 0,
-          fontFamily:
-            '-apple-system, BlinkMacSystemFont, system-ui, sans-serif',
-          backgroundColor: '#0f172a',
-          color: '#e5e7eb',
-        }}
-      >
-        {children}
+    <html lang="ko" suppressHydrationWarning>
+      <body className={inter.className}>
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="system"
+          enableSystem
+          disableTransitionOnChange
+        >
+          {children}
+        </ThemeProvider>
       </body>
     </html>
   );
