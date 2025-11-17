@@ -87,6 +87,7 @@ export interface ReportResponse {
   sales?: SalesSection | null;
   facility?: FacilitySummary | null;
   salesTrend?: SalesTrendItem[];
+  risk?: RiskInsight | null;
 }
 
 export interface AdviceOptions {
@@ -145,4 +146,21 @@ export interface SalesTrendItem {
   subwayStationCount: number;
   busStopCount: number;
   bankCount: number;
+
+  prevAlcoholTotalAmt?: number | null;
+  qoqGrowth?: number | null; // 직전 분기 대비 성장률 (없을 수도 있어서 optional)
+}
+
+export type RiskLevel = "low" | "medium" | "high";
+
+export interface RiskInsight {
+  level: RiskLevel;
+  reasons: string[];
+  metrics: {
+    recentQoqAvg?: number | null;        // 최근 4분기 평균 성장률
+    recentQoqVolatility?: number | null; // 최근 4분기 변동성(절대값 기준 평균)
+    negativeStreak?: number;             // 최근 연속 마이너스 분기 수
+    closeRate?: number | null;           // 최신 폐업률
+    changeIndex?: string | null;
+  };
 }

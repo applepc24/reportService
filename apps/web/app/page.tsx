@@ -1,6 +1,8 @@
 "use client"; // ← 이 줄만 추가하면 됩니다!
 
 import { useState, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -12,6 +14,14 @@ type DongOption = {
   id: number;
   name: string;
   code: string;
+};
+
+const toFriendlyLinks = (text: string): string => {
+  // http로 시작하는 URL을 전부 [술집 구경하기](url) 형식으로 교체
+  return text.replace(
+    /(https?:\/\/[^\s)]+)/g,
+    (url) => `[술집 구경하기](${url})`
+  );
 };
 
 const BAR_TYPES = [
@@ -441,9 +451,39 @@ export default function Home() {
 
                   {/* LLM이 준 마크다운 텍스트 그대로 보여주기 (간단히 pre 태그) */}
                   <div className="prose prose-invert max-w-none text-foreground/90">
-                    <pre className="whitespace-pre-wrap text-sm leading-relaxed">
-                      {adviceResult.advice}
-                    </pre>
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        a: (props) => (
+                          <a
+                            {...props}
+                            className="text-sky-300 underline underline-offset-2 hover:text-sky-200"
+                            target="_blank"
+                            rel="noreferrer"
+                          />
+                        ),
+                        h2: (props) => (
+                          <h2
+                            {...props}
+                            className="text-2xl font-bold mt-6 mb-3 text-primary"
+                          />
+                        ),
+                        h3: (props) => (
+                          <h3
+                            {...props}
+                            className="text-xl font-semibold mt-4 mb-2 text-secondary"
+                          />
+                        ),
+                        li: (props) => (
+                          <li {...props} className="leading-relaxed" />
+                        ),
+                        p: (props) => (
+                          <p {...props} className="leading-relaxed" />
+                        ),
+                      }}
+                    >
+                      {toFriendlyLinks(adviceResult.advice)}
+                    </ReactMarkdown>
                   </div>
 
                   {/* 주변 실제 술집 예시 */}

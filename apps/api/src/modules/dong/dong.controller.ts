@@ -14,11 +14,15 @@ export class DongController {
   }
 
   // GET /dong/search?q=연남
-  @Get('search')
-  search(@Query('q') q?: string): Promise<Dong[]> {
-    if (!q) {
-      return this.dongService.findAll();
-    }
-    return this.dongService.searchByName(q);
+  @Get("search")
+  async search(@Query("q") q: string) {
+    const rows = await this.dongService.searchByName(q);
+
+    return rows.map((d) => ({
+      id: d.id,
+      name: d.name,
+      // 여기 컬럼명은 실제 엔티티에 맞춰서(예시)
+      code: d.code,
+    }));
   }
 }

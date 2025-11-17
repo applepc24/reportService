@@ -12,7 +12,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
       database: process.env.DB_NAME || 'appdb',
       autoLoadEntities: true,  // 각 모듈에서 등록한 엔티티 자동 로딩
       synchronize: false,      // 우리는 ddl.sql로 테이블 만들었으니까 false
-      logging: true,           // 콘솔에 SQL 로그 찍기
+      logging: ["error", "warn"],           // 콘솔에 SQL 로그 찍기
     }),
   ],
 })

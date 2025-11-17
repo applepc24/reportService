@@ -76,4 +76,9 @@ export class DongQuarterSummary {
   busStopCount!: number | null;
   @ViewColumn()
   bankCount!: number | null;
+  @ViewColumn()
+  prevAlcoholTotalAmt!: string | null;  // bigint → string
+
+  @ViewColumn()
+  qoqGrowth!: number | null;    
 }

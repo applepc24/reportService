@@ -9,6 +9,8 @@ import { TrafficMetric } from './modules/traffic/entities/traffic-metric.entity'
 import { TrafficModule } from './modules/traffic/traffic.module';
 import { StoreModule } from './modules/store/store.module';
 import { SalesModule } from './modules/sale/sale.module';
+import { TrendDocsModule } from "./modules/trend-docs/trend-docs.module";
+import { NaverBlogModule } from './modules/naver-blog/naver-blog.module';
 
 @Module({
   imports: [
@@ -24,6 +26,8 @@ import { SalesModule } from './modules/sale/sale.module';
     TrafficModule,
     StoreModule,
     SalesModule,
+    TrendDocsModule,
+    NaverBlogModule,
   ],
 })
 export class AppModule {}

@@ -20,10 +20,13 @@ export class DongService {
   }
 
   // 이름 검색
-  searchByName(keyword: string): Promise<Dong[]> {
+  async searchByName(keyword: string): Promise<Dong[]> {
+    const q = keyword.trim();
+    if (!q) return [];
     return this.dongRepo.find({
-      where: { name: ILike(`%${keyword}%`) },
+      where: { name: ILike(`%${q}%`) },
       take: 20,
+      order: { name: "ASC" },
     });
   }
 
@@ -32,4 +35,5 @@ export class DongService {
       where: { id },
     });
   }
+  
 }

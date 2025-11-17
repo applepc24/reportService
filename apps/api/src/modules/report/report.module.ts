@@ -12,6 +12,9 @@ import { TAChangeModule } from "../ta_change/ta-change.module";
 import { SalesModule } from "../sale/sale.module";
 import { FacilityModule } from "../facility/facility.module";
 import { DongQuarterSummary } from "../summary/entities/dong_quarter_summary";
+import { TrendDocsModule } from "../trend-docs/trend-docs.module";
+import { NaverBlogModule } from '../naver-blog/naver-blog.module';
+
 
 
 @Module({
@@ -25,7 +28,9 @@ import { DongQuarterSummary } from "../summary/entities/dong_quarter_summary";
     StoreModule,
     TAChangeModule,
     SalesModule,
-    FacilityModule
+    FacilityModule,
+    TrendDocsModule,
+    NaverBlogModule,
   ],
   controllers: [ReportController],
   providers: [ReportService],
