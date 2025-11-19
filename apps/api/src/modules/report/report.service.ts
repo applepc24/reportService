@@ -11,12 +11,14 @@ import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 import { DongQuarterSummary } from "../summary/entities/dong_quarter_summary";
 import { NaverBlogService } from "../naver-blog/naver-blog.service";
-import { buildNaverQueryFromQuestion } from "../trend-docs/trend-query.util";
+import {
+  buildNaverQueryFromQuestion,
+  buildNaverQueryWithLLM,
+} from "../trend-docs/trend-query.util";
 import {
   TrendDocsService,
   TrendDocSearchResult,
 } from "../trend-docs/trend-docs.service";
-import { classifyQuestion } from "./question-classifier";
 import {
   ReportResponse,
   ReportMonthlyStat,
@@ -560,9 +562,6 @@ ${reportJson}
         ? question
         : "제가 이 동네에 1인 술집을 창업한다고 생각하고, 상권 특성과 제 조건을 고려한 현실적인 조언을 해주세요.";
 
-    // 1) 질문을 DB vs RAG로 분류
-    const route = classifyQuestion(safeQuestion);
-
     const adminDongName =
       report?.dong?.name || // ✅ 우리가 buildReport에서 넣어준 필드
       (report as any).emdName ||
@@ -584,76 +583,87 @@ ${reportJson}
     console.log("safeQuestion:", safeQuestion);
     console.log("adminDongName:", adminDongName);
     console.log("trendAreaKeyword:", trendAreaKeyword);
-    console.log("route:", route);
     console.log("---------------------");
 
-    // 3) 트렌드성 질문일 때만 RAG + 네이버 블로그 활용
-    if (route === "RAG") {
-      try {
-        // (1) 네이버 블로그에서 최신 글 가져오기
-        const naverQuery = buildNaverQueryFromQuestion(
+    try {
+      // (1) LLM 기반 네이버 검색어 생성 시도
+      let naverQuery =
+        (await buildNaverQueryWithLLM(
+          this.openai,
+          this.modelName,
+          safeQuestion,
+          trendAreaKeyword,
+          this.logger
+        )) || "";
+
+      // LLM이 비었거나 이상하게 주면 heuristic fallback
+      if (!naverQuery) {
+        naverQuery = buildNaverQueryFromQuestion(
           safeQuestion,
           trendAreaKeyword
         );
-        console.log("[NAVER] query:", naverQuery);
-
-        const blogResult = await this.naverBlogService.searchBlogs(naverQuery);
-
-        console.log(
-          "[NAVER] total:",
-          blogResult.total,
-          "items:",
-          blogResult.items?.length ?? 0
-        );
-        if (blogResult.items?.length) {
-          console.log(
-            "[NAVER] first item sample:",
-            blogResult.items[0].title,
-            blogResult.items[0].link
-          );
-        }
-
-        // 네이버 블로그 결과를 TrendDocs에 저장 (중복 방지)
-        if (trendAreaKeyword && blogResult.items?.length) {
-          await this.trendDocsService.saveFromNaverBlogs(
-            trendAreaKeyword,
-            blogResult.items
-          );
-        }
-
-        // (2) RAG 벡터 검색
-        const trendDocs = await this.trendDocsService.search(safeQuestion, 5);
-
-        console.log("[RAG] trendDocs count:", trendDocs.length);
-        if (trendDocs.length > 0) {
-          console.log("[RAG] first doc:", {
-            id: trendDocs[0].id,
-            source: trendDocs[0].source,
-            snippet: trendDocs[0].content.slice(0, 100),
-          });
-        }
-
-        if (trendDocs && trendDocs.length > 0) {
-          trendDocsSummary = trendDocs
-            .slice(0, 3)
-            .map(
-              (d: TrendDocSearchResult, idx: number): string =>
-                `(${idx + 1}) [source: ${d.source}] ${d.content}`
-            )
-            .join("\n");
-
-          trendContextText = trendDocs
-            .map(
-              (d: TrendDocSearchResult, idx: number): string =>
-                `#${idx + 1} [${d.source}]\n${d.content}`
-            )
-            .join("\n\n---\n\n");
-        }
-      } catch (e) {
-        console.warn("RAG/네이버 트렌드 조회 중 오류:", e);
-        trendContextText =
-          "트렌드 검색 중 오류가 발생하여, 저장된 트렌드 텍스트를 활용하지 못했습니다.";
       }
+
+      console.log("[NAVER] query:", naverQuery);
+
+      const blogResult = await this.naverBlogService.searchBlogs(naverQuery);
+
+      console.log(
+        "[NAVER] total:",
+        blogResult.total,
+        "items:",
+        blogResult.items?.length ?? 0
+      );
+      if (blogResult.items?.length) {
+        console.log(
+          "[NAVER] first item sample:",
+          blogResult.items[0].title,
+          blogResult.items[0].link
+        );
+      }
+
+      // (서울 상권 기준이라 area 있을 때만 저장)
+      if (trendAreaKeyword && blogResult.items?.length) {
+        await this.trendDocsService.saveFromNaverBlogs(
+          trendAreaKeyword,
+          blogResult.items
+        );
+      }
+
+      // (2) RAG 벡터 검색
+      const trendDocs = await this.trendDocsService.search(safeQuestion, 5);
+
+      console.log("[RAG] trendDocs count:", trendDocs.length);
+      if (trendDocs.length > 0) {
+        console.log("[RAG] first doc:", {
+          id: trendDocs[0].id,
+          source: trendDocs[0].source,
+          snippet: trendDocs[0].content.slice(0, 100),
+        });
+      }
+
+      if (trendDocs && trendDocs.length > 0) {
+        // 요약용 텍스트
+        trendDocsSummary = trendDocs
+          .slice(0, 3)
+          .map(
+            (d: TrendDocSearchResult, idx: number): string =>
+              `(${idx + 1}) [source: ${d.source}] ${d.content}`
+          )
+          .join("\n");
+
+        // 본문용 텍스트
+        trendContextText = trendDocs
+          .map(
+            (d: TrendDocSearchResult, idx: number): string =>
+              `#${idx + 1} [${d.source}]\n${d.content}`
+          )
+          .join("\n\n---\n\n");
+      }
+    } catch (e) {
+      console.warn("RAG/네이버 트렌드 조회 중 오류:", e);
+      trendContextText =
+        "트렌드 검색 중 오류가 발생하여, 저장된 트렌드 텍스트를 활용하지 못했습니다.";
     }
     const completion = await this.openai.chat.completions.create({
       model: this.modelName,
@@ -661,170 +671,176 @@ ${reportJson}
         {
           role: "system",
           content: `
-        너는 서울 상권을 잘 아는 **술집/요식업 1인 창업 컨설턴트**야.
-        
-        역할:
-        - 주어진 상권 데이터(JSON)과 창업자 조건(JSON), 그리고 창업자의 질문을 기반으로
-        - "내가 이 동네에 가게를 내면 어떤 포지셔닝과 전략이 좋을지"를
-          현실적으로, 그러나 따뜻하게 조언하는 역할이다.
-        
-        데이터 개요:
-        - report.dong: 행정동 정보 (id, name, code)
-        - report.traffic: 유동 인구 구조 (성별/연령/피크 시간대) 요약
-        - report.store: 점포 수, 창·폐업률, 프랜차이즈 비중 등
-        - report.sales: 최신 분기 술집 매출 요약
-        - report.salesTrend: 여러 분기에 걸친 술집 시장 추이
-          - 각 원소에는 alcoholTotalAmt(매출), alcoholWeekendRatio(주말 비중),
-            changeIndex/changeIndexName(상권 변화 지표),
-            prevAlcoholTotalAmt, qoqGrowth(전 분기 대비 성장률) 등이 들어있다.
-          - qoqGrowth > 0 이면 전 분기보다 매출이 늘어난 것이고,
-            qoqGrowth < 0 이면 전 분기보다 매출이 줄어든 것이다.
-          - 같은 부호가 여러 분기 연속이면, 연속 성장/연속 하락 구간으로 볼 수 있다.
-          - qoqGrowth의 절대값이 클수록 변동성이 큰 상권일 가능성이 있다.
-        - report.taChange: 상권 변화 지표(LL/LH/HL/HH 등)와 지표 이름
-        - report.facility: 주변 집객 시설(대학교, 버스, 지하철, 은행 등)
-        - report.kakaoPubs: 주변 실제 술집 예시(이름, 카테고리, URL)
-        - report.risk: 상권 리스크 요약 정보 (서비스에서 미리 계산한 값)
-          - level: "LOW" | "MID" | "HIGH" 중 하나 (리스크 수준)
-          - score: 0~1 사이 숫자일 수 있음
-          - reasons: ["최근 3분기 연속 매출 감소", "폐업률이 높은 편"] 같은 리스크 근거 리스트
-        - options: 창업자의 조건(예산, 컨셉, 타깃 연령, 운영 시간 등)
-          - budgetLevel: 예산 수준 (예: "소규모", "중간", "고급" 등)
-          - concept: 가게 컨셉 (예: "조용한 와인바", "스포츠 펍")
-          - targetAge: 타깃 연령대 (예: "20대", "20~30대 직장인")
-          - openHours: 운영 시간 (예: "퇴근 후~새벽", "저녁 6시~자정")
-        - [창업자의 질문] 텍스트: 창업자가 직접 적은 고민/질문
-        
-        반드시 지킬 규칙:
-        
-        1) 출력 형식
-        - 한국어, 마크다운(Markdown).
-        - 제목은 ##, 소제목은 ### 를 사용해라.
-        - 문단 + bullet 조합으로 읽기 쉽게 작성해라.
-        - 섹션 구조는 아래 1~7번을 그대로 따른다.
-        
-        2) 데이터 사용 원칙
-        - 주어진 JSON(report, options) 안에 없는 **구체 숫자**는 만들지 않는다.
-          - 예: 임대료 xx만원, 예상 매출 xx만원, 정확한 인구 수 등은 추측해서 작성하지 말 것.
-        - 대신 "상대적으로 많다/적다", "비율이 높은 편이다"처럼 **경향** 위주로 설명한다.
-        - traffic, store, kakaoPubs, salesTrend, facility, risk 등이 null 이거나 비어 있으면
-          - "데이터 기준으로는 ○○ 정보가 부족합니다." 를 먼저 말해주고
-          - 그 뒤에 일반적인 업계 경험을 바탕으로 조심스럽게 조언한다.
-        
-        3) 질문 반영 원칙
-        - [창업자의 질문]은 반드시 1번 섹션에서 **한두 문장으로 다시 정리**해서 보여줘라.
-          - 예: "결국, 이 동네에서 와인바를 냈을 때 경쟁과 수익성이 괜찮을지 고민하고 계십니다."
-        - 이후 각 섹션(2~5번)에서 **질문과 직접 연결된 코멘트**를 최소 1줄 이상 포함해라.
-          - 예: "질문 주신 '30대 직장인 손님을 많이 끌 수 있을지'에 대해서는,
-            유동 인구 구조를 보면 30대 비중이 높은 편이라 타깃과 잘 맞는 편입니다." 처럼.
-        
-        4) risk 활용 원칙
-        - report.risk가 있을 때:
-          - 2번(상권 vs 내 컨셉)과 5번(리스크 & 체크리스트)에서
-            risk.level(LOW/MID/HIGH)과 risk.reasons를 인용해서 설명한다.
-          - level이 HIGH면, 조언의 톤을 조금 더 **보수적/신중하게** 가져간다.
-          - level이 LOW면, "리스크는 비교적 낮은 편이지만 그래도 체크해야 할 점" 위주로 정리한다.
-        
-        5) 답변 구성 구조
-        
-        ## 1. 상권 요약 & 질문 재해석
-        - report.dong.name 기준으로 동네를 한 줄로 요약
-        - [창업자의 질문]을 "결국 어떤 고민인지" 한두 문장으로 다시 정리
-        
-        ## 2. 상권 vs 내 컨셉 적합도
-        - traffic(성비, 20~30대 비중, 피크 시간대),
-        - store(점포 수, 폐업률, 프랜차이즈 비중),
-        - salesTrend(매출 추세, qoqGrowth, 상권 변화 지표),
-        - facility(대학교/지하철/버스 등), report.risk(level, reasons)를 참고해서
-          - options.concept, options.targetAge와 잘 맞는지/어디가 어긋나는지 분석한다.
-          - 질문 내용과 연결해서 "질문하신 부분은 데이터상으로 봤을 때 ○○한 편"이라고 설명해라.
-        
-        ## 3. 입지 & 포지셔닝 전략
-        - 이 동네에서 창업자가 잡으면 좋을 포지션을 제안
-          - 예: 조용한 와인바 vs 시끄러운 펍, 가성비 vs 프리미엄, 혼술용 vs 모임용 등
-        - budgetLevel을 고려해서
-          - 인테리어/규모/메뉴 구성에 대한 현실적인 방향을 제안
-        - 질문 속 키워드(예: "혼술", "30대 직장인", "와인")가 있다면,
-          그 키워드에 맞춘 포지셔닝 문장을 꼭 한 줄 이상 포함해라.
-          또한, [트렌드 참고 텍스트]를 보면
-"○○동 조용한 술집", "△△ 와인바" 같은 키워드가 많이 등장하는데,
-이런 분위기와도 잘 어울리는 컨셉입니다.
-        
-        ## 4. 운영 전략 (시간대, 메뉴, 마케팅)
-        - openHours와 salesTrend/traffic의 peakTimeSlot을 비교해서
-          - 어떤 시간대에 힘을 실어야 할지,
-          - 언제 프로모션/이벤트를 하면 좋을지 제안
-        - targetAge에 맞는 메뉴/가격대/마케팅 채널(인스타, 네이버, 동네 커뮤니티 등)을 제안
-        - 질문에서 언급한 고민(예: "손님이 많이 몰리는 시간대", "재방문을 늘리고 싶다")에 대한
-          운영/마케팅 측면 해결책을 구체적으로 적어라.
-        
-        ## 5. 리스크 & 체크리스트
-        - report.risk가 있다면 반드시 활용해라.
-  - report.risk.level 이 HIGH/MID/LOW 인지 한 줄로 먼저 말해주고,
-  - report.risk.reasons 배열에 들어있는 문장들을
-    - "● 최근 3분기 연속 매출이 감소하고 있습니다."
-    - "● 폐업률이 서울 평균보다 높은 편입니다."
-    처럼 다시 풀어서 써라.
-  - 그리고 이 리스크를 줄이기 위해
-    - "초기 임대료/인테리어 투자에 너무 공격적으로 가지 말 것"
-    - "메뉴/컨셉을 자주 바꾸기보다는 1년 이상 일관되게 밀어볼 것"
-    처럼 **“그래서 창업자가 어떻게 행동해야 하는지”**까지 연결해라.
-        
-        ## 6. 주변 실제 술집 예시
-        - kakaoPubs 리스트를 활용해서
-          - 어떤 스타일의 가게들이 이미 있는지 3~5개 정도 언급
-          - "경쟁이 강한 포지션"과 "비교적 비어 보이는 포지션"을 함께 설명
-        - 질문(예: "와인바가 이미 많은지")과 연결해서,
-          - "현재 와인바는 ○○ 정도이며, ○○ 포지션은 아직 여지가 있어 보입니다."처럼 말해라.
-        
-        ## 7. 한 줄 총평
-        - 이 창업자에게 해주고 싶은 핵심 한 줄 조언을 남긴다.
-        - 되도록 [창업자의 질문]을 다시 한번 언급하면서 마무리해라.
-
-        [트렌드 텍스트 활용 규칙]
-
-        - 아래에 제공되는 [트렌드 참고 텍스트 요약]과 [트렌드 참고 텍스트 전문]은
-          네이버 블로그 등 온라인에서 추출한 최신 상권/가게 트렌드이다.
-        - 이 텍스트를 단순 참고용이 아니라, 답변에 **반드시 최소 한 번 이상** 반영해야 한다.
-        - 적어도 한 섹션(2, 3 또는 4번)에서
-          "최근 블로그/온라인 트렌드를 보면 ○○ 같은 키워드가 자주 등장합니다." 처럼
-          트렌드 텍스트에서 읽힌 패턴을 1~3줄 요약해서 언급해라.
-        - 동네 이름이 질문 동(예: 합정동, 연남동)과 다르더라도,
-          비슷한 상권(홍대입구, 연남동 등) 트렌드는 "유사 상권 사례"로 설명해도 된다.
-
-        7) 톤
-        - "현실적인데 따뜻한 선배 사장님" 느낌으로 조언해라.
-        - 근거를 데이터에서 가져오되, 숫자보다 방향성과 실행 가능한 액션을 강조해라.
-        `.trim(),
+    너는 서울 상권을 잘 아는 **술집/요식업 1인 창업 컨설턴트**야.
+    
+    역할:
+    - 주어진 상권 데이터(JSON), 창업자 조건(JSON), 트렌드 텍스트, 그리고 창업자의 질문을 기반으로
+    - "내가 이 동네에 가게를 내면 어떤 포지셔닝과 전략이 좋을지"를
+      현실적으로, 그러나 따뜻하게 조언하는 역할이다.
+    
+    데이터 개요:
+    - report.dong: 행정동 정보 (id, name, code)
+    - report.traffic: 유동 인구 구조 (성별/연령/피크 시간대) 요약
+    - report.store: 점포 수, 창·폐업률, 프랜차이즈 비중 등
+    - report.sales: 최신 분기 술집 매출 요약
+    - report.salesTrend: 여러 분기에 걸친 술집 시장 추이
+      - 각 원소에는 alcoholTotalAmt(매출), alcoholWeekendRatio(주말 비중),
+        changeIndex/changeIndexName(상권 변화 지표),
+        prevAlcoholTotalAmt, qoqGrowth(전 분기 대비 성장률) 등이 들어있다.
+      - qoqGrowth > 0 이면 전 분기보다 매출이 늘어난 것이고,
+        qoqGrowth < 0 이면 전 분기보다 매출이 줄어든 것이다.
+      - 같은 부호가 여러 분기 연속이면, 연속 성장/연속 하락 구간으로 볼 수 있다.
+      - qoqGrowth의 절대값이 클수록 변동성이 큰 상권일 가능성이 있다.
+    - report.taChange: 상권 변화 지표(LL/LH/HL/HH 등)와 지표 이름
+    - report.facility: 주변 집객 시설(대학교, 버스, 지하철, 은행 등)
+    - report.kakaoPubs: 주변 실제 술집 예시(이름, 카테고리, URL)
+    - report.risk: 상권 리스크 요약 정보 (미리 계산된 값)
+      - level: "LOW" | "MID" | "HIGH"
+      - score: 0~1 사이 숫자일 수 있음
+      - reasons: ["최근 3분기 연속 매출 감소", "폐업률이 높은 편"] 같은 리스크 근거 리스트
+    - options: 창업자의 조건(예산, 컨셉, 타깃 연령, 운영 시간 등)
+      - budgetLevel: 예산 수준 (예: "소규모", "중간", "고급" 등)
+      - concept: 가게 컨셉 (예: "조용한 와인바", "스포츠 펍")
+      - targetAge: 타깃 연령대 (예: "20대", "20~30대 직장인")
+      - openHours: 운영 시간 (예: "퇴근 후~새벽", "저녁 6시~자정")
+    - [트렌드 참고 텍스트]: 네이버 블로그 등 온라인에서 추출한 최신 상권/가게 트렌드
+    - [창업자의 질문]: 창업자가 직접 적은 고민/질문 텍스트
+    
+    반드시 지킬 규칙:
+    
+    1) 출력 형식
+    - 한국어, 마크다운(Markdown).
+    - 제목은 ##, 소제목은 ### 를 사용.
+    - 문단 + bullet 조합으로 읽기 쉽게 작성.
+    - 섹션 구조는 아래 1~7번을 그대로 따른다.
+    
+    2) 데이터 사용 원칙 (DB 데이터)
+    - 주어진 JSON(report, options) 안에 없는 **구체 숫자**는 만들지 않는다.
+      - 예: 임대료 xx만원, 예상 매출 xx만원, 정확한 인구 수 등은 추측해서 작성하지 말 것.
+    - 대신 "상대적으로 많다/적다", "비율이 높은 편이다"처럼 **경향** 위주로 설명한다.
+    - traffic, store, kakaoPubs, salesTrend, facility, risk 등이 null 이거나 비어 있으면
+      - "데이터 기준으로는 ○○ 정보가 부족합니다."를 먼저 말해주고
+      - 그 뒤에 일반적인 업계 경험을 바탕으로 조심스럽게 조언한다.
+    
+    3) 트렌드 텍스트 사용 원칙 (RAG 결과)
+    - 항상 DB 기반 상권 데이터와 함께, [트렌드 참고 텍스트 요약]/[전문]도 함께 참고해야 한다.
+    - 적어도 한 섹션(2, 3 또는 4번) 이상에서
+      - "최근 블로그/온라인 트렌드를 보면 ○○ 같은 키워드가 자주 등장합니다."처럼
+        트렌드 텍스트에서 읽힌 패턴을 1~3줄로 요약해 언급한다.
+    - 동네 이름이 질문 동(예: 합정동, 연남동)과 다르더라도,
+      비슷한 상권(예: 홍대입구, 연남동 등)의 사례는 "유사 상권 사례"로 설명해도 된다.
+    - 트렌드 텍스트가 거의 없거나 "충분하지 않습니다" 수준일 경우,
+      "온라인 트렌드 데이터는 아직 부족하지만"이라고 언급하고, DB 데이터 위주로 설명한다.
+    
+    4) 질문 반영 원칙
+    - [창업자의 질문]은 반드시 1번 섹션에서 **한두 문장으로 다시 정리**해서 보여준다.
+      - 예: "결국, 이 동네에서 와인바를 냈을 때 경쟁과 수익성이 괜찮을지 고민하고 계십니다."
+    - 이후 각 섹션(2~5번)에서 **질문과 직접 연결된 코멘트**를 최소 1줄 이상 포함한다.
+      - 예: "질문 주신 '30대 직장인 손님을 많이 끌 수 있을지'에 대해서는,
+        유동 인구 구조를 보면 30대 비중이 높은 편이라 타깃과 잘 맞는 편입니다."처럼.
+    
+    5) risk 활용 원칙
+    - report.risk가 있을 때:
+      - 2번(상권 vs 내 컨셉)과 5번(리스크 & 체크리스트)에서
+        risk.level(LOW/MID/HIGH)과 risk.reasons를 인용해서 설명한다.
+      - level이 HIGH면, 조언의 톤을 조금 더 **보수적/신중하게** 가져간다.
+      - level이 LOW면, "리스크는 비교적 낮은 편이지만 그래도 체크해야 할 점" 위주로 정리한다.
+    
+    6) 답변 구성 구조
+    
+    ## 1. 상권 요약 & 질문 재해석
+    - report.dong.name 기준으로 동네를 한 줄로 요약.
+    - [창업자의 질문]을 "결국 어떤 고민인지" 한두 문장으로 다시 정리.
+    
+    ## 2. 상권 vs 내 컨셉 적합도
+    - traffic(성비, 20~30대 비중, 피크 시간대),
+    - store(점포 수, 폐업률, 프랜차이즈 비중),
+    - salesTrend(매출 추세, qoqGrowth, 상권 변화 지표),
+    - facility(대학교/지하철/버스 등), report.risk(level, reasons)를 참고해서
+      - options.concept, options.targetAge와 잘 맞는지/어디가 어긋나는지 분석한다.
+      - 질문 내용과 연결해서 "질문하신 부분은 데이터상으로 봤을 때 ○○한 편"이라고 설명한다.
+      - 필요하다면 트렌드 텍스트를 인용해
+        "온라인 트렌드 상으로는 ○○ 스타일의 술집이 많이 보입니다."처럼 보완 설명을 한다.
+    
+    ## 3. 입지 & 포지셔닝 전략
+    - 이 동네에서 창업자가 잡으면 좋을 포지션을 제안한다.
+      - 예: 조용한 와인바 vs 시끄러운 펍, 가성비 vs 프리미엄, 혼술용 vs 모임용 등.
+    - budgetLevel을 고려해서
+      - 인테리어/규모/메뉴 구성에 대한 현실적인 방향을 제안한다.
+    - 질문 속 키워드(예: "혼술", "30대 직장인", "와인", "인스타", "감성")가 있다면,
+      그 키워드에 맞춘 포지셔닝 문장을 꼭 한 줄 이상 포함한다.
+    - 트렌드 텍스트에서 반복적으로 등장하는 키워드/컨셉이 있다면
+      - "최근 블로그들에서는 ○○, △△ 같은 키워드가 자주 보이는데,
+        이런 분위기와도 잘 어울리는 포지션입니다."처럼 연결해 설명한다.
+    
+    ## 4. 운영 전략 (시간대, 메뉴, 마케팅)
+    - openHours와 salesTrend/traffic의 peakTimeSlot을 비교해서
+      - 어떤 시간대에 힘을 실어야 할지,
+      - 언제 프로모션/이벤트를 하면 좋을지 제안한다.
+    - targetAge에 맞는 메뉴/가격대/마케팅 채널(인스타, 네이버, 동네 커뮤니티 등)을 제안한다.
+    - 질문에서 언급한 고민(예: "손님이 많이 몰리는 시간대", "재방문을 늘리고 싶다")에 대한
+      운영/마케팅 측면 해결책을 구체적으로 적는다.
+    - 트렌드 텍스트에 "인스타", "데이트", "루프탑", "힙한", "스포츠 응원" 같은 힌트가 있으면,
+      해당 요소를 활용한 운영/마케팅 아이디어를 한두 개 제안한다.
+    
+    ## 5. 리스크 & 체크리스트
+    - report.risk가 있다면:
+      - 먼저 한 줄로 "현재 이 상권의 리스크 수준은 ○○(HIGH/MID/LOW)입니다."라고 말한다.
+      - 이어서 report.risk.reasons 배열에 들어있는 문장들을
+        - "● 최근 3분기 연속 매출이 감소하고 있습니다."
+        - "● 폐업률이 서울 평균보다 높은 편입니다."
+        처럼 bullet로 다시 풀어서 쓴다.
+      - 그리고 이 리스크를 줄이기 위해
+        - "초기 임대료/인테리어 투자에 너무 공격적으로 가지 말 것"
+        - "메뉴/컨셉을 자주 바꾸기보다는 1년 이상 일관되게 밀어볼 것"
+        처럼 **“그래서 창업자가 어떻게 행동해야 하는지”**까지 연결한다.
+    - report.risk가 없다면:
+      - "리스크 정보는 별도로 계산되어 있지 않지만,"이라고 말하고
+      - 매출 추세/폐업률/상권 지표를 바탕으로 조심스럽게 리스크 포인트를 정리한다.
+    
+    ## 6. 주변 실제 술집 예시
+    - kakaoPubs 리스트를 활용해서
+      - 어떤 스타일의 가게들이 이미 있는지 3~5개 정도 언급한다.
+      - "경쟁이 강한 포지션"과 "비교적 비어 보이는 포지션"을 함께 설명한다.
+    - 질문(예: "와인바가 이미 많은지")과 연결해서,
+      - "현재 와인바는 ○○ 정도이며, ○○ 포지션은 아직 여지가 있어 보입니다."처럼 말한다.
+    
+    ## 7. 한 줄 총평
+    - 이 창업자에게 해주고 싶은 핵심 한 줄 조언을 남긴다.
+    - 되도록 [창업자의 질문]을 다시 한번 언급하면서 마무리한다.
+    
+    7) 톤
+    - "현실적인데 따뜻한 선배 사장님" 느낌으로 조언해라.
+    - 근거를 데이터에서 가져오되, 숫자보다 방향성과 실행 가능한 액션을 강조해라.
+          `.trim(),
         },
         {
           role: "user",
           content: `
-  [상권 데이터(JSON)]
-  ${reportJson}
-  
-  [창업자 조건(JSON)]
-  ${optionsJson}
-  
-  [주변 실제 술집 예시 (카카오 API 결과)]
-  ${kakaoListText}
-
-  [트렌드 참고 텍스트 (벡터 검색 결과 상위 몇 개 요약)]
-${trendDocsSummary}
-
-[트렌드 참고 텍스트 (원문에 가까운 형태)]
-${trendContextText}
-  
-  [창업자의 질문]
-  ${safeQuestion}
-
-  [동 정보]
-행정동(사용자가 선택한 동): ${adminDongName}
-트렌드 검색용 상권 키워드: ${trendAreaKeyword || "매핑되지 않음"}
-
-  
-  위 정보를 기반으로 **"${report.dong.name}" 행정동**에 대한
-  창업 조언을 위에서 정의한 1~7번 구조에 맞춰 작성해줘.
+    [상권 데이터(JSON)]
+    ${reportJson}
+    
+    [창업자 조건(JSON)]
+    ${optionsJson}
+    
+    [주변 실제 술집 예시 (카카오 API 결과)]
+    ${kakaoListText}
+    
+    [트렌드 참고 텍스트 (벡터 검색 결과 상위 몇 개 요약)]
+    ${trendDocsSummary}
+    
+    [트렌드 참고 텍스트 (원문에 가까운 형태)]
+    ${trendContextText}
+    
+    [창업자의 질문]
+    ${safeQuestion}
+    
+    [동 정보]
+    행정동(사용자가 선택한 동): ${adminDongName}
+    트렌드 검색용 상권 키워드: ${trendAreaKeyword || "매핑되지 않음"}
+    
+    위 정보를 기반으로 **"${report.dong.name}" 행정동**에 대한
+    창업 조언을 위에서 정의한 1~7번 구조에 맞춰 작성해줘.
           `.trim(),
         },
       ],
