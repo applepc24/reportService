@@ -2,6 +2,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { ConfigService } from '@nestjs/config';
+import { isPerfFakeExternal, delay } from "../../common/utils/perf.util";
 
 export interface KakaoPlace {
   id: string;
@@ -32,6 +33,14 @@ export class KakaoLocalService {
     dongName: string,
     options?: { size?: number },
   ): Promise<KakaoPlace[]> {
+
+    if (isPerfFakeExternal()) {
+      // 네트워크 레이턴시 흉내 (20~50ms)
+      await delay(30);
+
+      // "카카오 API 구조" 맞춰서 더미 반환
+      return [];
+    }
     const query = `${dongName} 술집`;
     const size = options?.size ?? 5;
 

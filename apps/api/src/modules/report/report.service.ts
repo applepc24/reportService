@@ -12,6 +12,11 @@ import { Repository } from "typeorm";
 import { DongQuarterSummary } from "../summary/entities/dong_quarter_summary";
 import { NaverBlogService } from "../naver-blog/naver-blog.service";
 import {
+  isPerfFakeExternal,
+  isPerfFakeLLM,
+  fakeLLMResponse,
+} from "../../common/utils/perf.util";
+import {
   buildNaverQueryFromQuestion,
   buildNaverQueryWithLLM,
 } from "../trend-docs/trend-query.util";
@@ -376,6 +381,9 @@ export class ReportService {
   // src/modules/report/report.service.ts 안에
 
   async generateReportText(report: ReportResponse): Promise<string> {
+    if (isPerfFakeExternal() || isPerfFakeLLM()) {
+      return fakeLLMResponse("report-text");
+    }
     const reportJson = JSON.stringify(report, null, 2);
 
     const completion = await this.openai.chat.completions.create({
@@ -544,6 +552,10 @@ ${reportJson}
     options: AdviceOptions,
     question: string
   ): Promise<string> {
+    if (isPerfFakeExternal() || isPerfFakeLLM()) {
+      return fakeLLMResponse("report-advice");
+    }
+
     const reportJson = JSON.stringify(report, null, 2);
     const optionsJson = JSON.stringify(options, null, 2);
     const kakaoPubs = report.kakaoPubs ?? [];
@@ -631,15 +643,28 @@ ${reportJson}
       }
 
       // (2) RAG 벡터 검색
-      const trendDocs = await this.trendDocsService.search(safeQuestion, 5);
+      const trendDocs = await this.trendDocsService.searchHybrid(
+        safeQuestion,
+        5, // finalK
+        20, // recallK
+        trendAreaKeyword,
+      );
 
       console.log("[RAG] trendDocs count:", trendDocs.length);
       if (trendDocs.length > 0) {
-        console.log("[RAG] first doc:", {
-          id: trendDocs[0].id,
-          source: trendDocs[0].source,
-          snippet: trendDocs[0].content.slice(0, 100),
-        });
+        console.log(
+          "[RAG] top docs (scores):",
+          trendDocs.map((d: any) => ({
+            id: d.id,
+            area: d.area,
+            source: d.source,
+            distance: d.distance,
+            lexical: d.lexical,
+            vectorScore: d.vectorScore,
+            finalScore: d.finalScore,
+            snippet: d.content.slice(0, 60),
+          }))
+        );
       }
 
       if (trendDocs && trendDocs.length > 0) {

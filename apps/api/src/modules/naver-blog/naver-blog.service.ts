@@ -4,7 +4,7 @@ import { HttpService } from "@nestjs/axios";
 import { ConfigService } from "@nestjs/config";
 import { firstValueFrom } from "rxjs";
 import { NaverBlogItem, NaverBlogSearchResult } from "./naver-blog.types";
-
+import { isPerfFakeExternal, delay } from "../../common/utils/perf.util";
 
 function stripHtml(html?: string): string {
   if (!html) return "";
@@ -19,10 +19,22 @@ export class NaverBlogService {
 
   constructor(
     private readonly httpService: HttpService,
-    private readonly configService: ConfigService,
+    private readonly configService: ConfigService
   ) {}
 
   async searchBlogs(query: string): Promise<NaverBlogSearchResult> {
+    if (isPerfFakeExternal()) {
+      await delay(30); // 레이턴시 살짝 흉내
+
+      return {
+        lastBuildDate: "",
+        total: 0,
+        start: 1,
+        display: 0,
+        items: [],
+      };
+    }
+
     if (!query || !query.trim()) {
       return {
         lastBuildDate: "",
@@ -76,5 +88,4 @@ export class NaverBlogService {
       items,
     };
   }
-
 }
