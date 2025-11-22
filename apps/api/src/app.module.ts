@@ -11,6 +11,7 @@ import { StoreModule } from './modules/store/store.module';
 import { SalesModule } from './modules/sale/sale.module';
 import { TrendDocsModule } from "./modules/trend-docs/trend-docs.module";
 import { NaverBlogModule } from './modules/naver-blog/naver-blog.module';
+import { HealthModule } from './modules/health/health.module';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { NaverBlogModule } from './modules/naver-blog/naver-blog.module';
     SalesModule,
     TrendDocsModule,
     NaverBlogModule,
+    HealthModule,
   ],
 })
 export class AppModule {}
