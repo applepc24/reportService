@@ -73,9 +73,7 @@ export default function Home() {
     const handler = setTimeout(async () => {
       try {
         const res = await fetch(
-          `${
-            process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000"
-          }/dong/search?q=${encodeURIComponent(searchQuery)}`
+          `/api/dong/search?q=${encodeURIComponent(searchQuery)}`
         );
         const data: DongOption[] = await res.json();
         setDongOptions(data);
@@ -83,7 +81,7 @@ export default function Home() {
         console.error(e);
         setDongOptions([]);
       }
-    }, 300); // 0.3초 디바운스
+    }, 300);
 
     return () => clearTimeout(handler);
   }, [searchQuery]);
