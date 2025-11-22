@@ -1,6 +1,10 @@
 // lib/api.ts
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000";
+  typeof window === "undefined"
+    // 서버(SSR/빌드)에서는 기존 env나 localhost 사용
+    ? (process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000")
+    // 브라우저(클라이언트)에서는 무조건 Vercel rewrite 경로 사용
+    : "/api";
 
 export type AdviceRequest = {
   dongId: number;
@@ -38,9 +42,6 @@ export async function fetchAdvice(
     headers: {
       "Content-Type": "application/json",
     },
-    // Next 13+에서 클라이언트 컴포넌트에서 부르는 거라면 cache: "no-store" 안줘도 되지만
-    // 필요하면 추가:
-    // cache: "no-store",
     body: JSON.stringify(payload),
   });
 
