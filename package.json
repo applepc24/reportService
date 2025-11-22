@@ -1,0 +1,7 @@
+{
+  "name": "reportservice",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ]
+}
