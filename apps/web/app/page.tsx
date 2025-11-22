@@ -49,7 +49,7 @@ const TARGET_AGES = [
 
 export default function Home() {
   const [step, setStep] = useState(0);
-  const [selectedDistrict, setSelectedDistrict] = useState("");
+  const [_selectedDistrict, setSelectedDistrict] = useState("");
   const [selectedDongId, setSelectedDongId] = useState<number | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [barType, setBarType] = useState("");
