@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Card } from "@/components/ui/card";
 import { Search } from "lucide-react";
-import { fetchAdvice, AdviceResponse } from "@/lib/api";
+import { requestAdviceAsync, AdviceResponse } from "@/lib/api";
 
 type DongOption = {
   id: number;
@@ -69,7 +69,6 @@ export default function Home() {
       setDongOptions([]);
       return;
     }
-
     const handler = setTimeout(async () => {
       try {
         const res = await fetch(
@@ -102,22 +101,33 @@ export default function Home() {
     }
 
     setIsLoading(true);
-    setShowReport(true); // 리포트 영역으로 스크롤만 먼저
+    setShowReport(true);
     setError(null);
+    setAdviceResult(null);
 
     try {
-      const result = await fetchAdvice({
-        dongId: selectedDongId,
-        concept: barType,
-        budgetLevel: capital,
-        targetAge,
-        // 아직 UI에 운영시간 질문 없으니까 일단 기본 값 하나 넘겨두자
-        openHours: "저녁 시간대 중심",
-        question: userQuestion,
-      });
+      // ✅ requestAdviceAsync가 큐 넣고 + 폴링까지 해서
+      // 최종 AdviceResponse를 바로 돌려줌
+      const result = await requestAdviceAsync(
+        {
+          dongId: selectedDongId,
+          concept: barType,
+          budgetLevel: capital,
+          targetAge,
+          openHours: "저녁 시간대 중심",
+          question: userQuestion,
+        },
+        {
+          intervalMs: 1500,
+          maxWaitMs: 60_000,
+          onTick: (status) => {
+            // 필요하면 로딩 UI에 표시만
+            console.log("poll status:", status);
+          },
+        }
+      );
 
       setAdviceResult(result);
-      // 응답 받은 행정동 이름을 타이틀에 쓰고 싶으면:
       setSelectedDistrict(result.report.dong.name);
       scrollToSection("report-section");
     } catch (e: any) {
@@ -429,6 +439,7 @@ export default function Home() {
             <Card className="p-8 md:p-12 animate-slide-up bg-surface/95 backdrop-blur border-none shadow-2xl">
               {isLoading ? (
                 // 🔄 로딩 스켈레톤 그대로 사용
+
                 <div className="space-y-6">
                   <div className="h-8 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
                   <div className="h-12 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
@@ -444,10 +455,10 @@ export default function Home() {
                     AI 상권 리포트
                   </div>
                   <h2 className="text-4xl font-bold mb-6">
-                    {adviceResult.report.dong.name} 술집 상권 분석 & 창업 조언
+                    {adviceResult?.report?.dong?.name ?? "선택한 동네"} 술집
+                    상권 분석 & 창업 조언
                   </h2>
 
-                  {/* LLM이 준 마크다운 텍스트 그대로 보여주기 (간단히 pre 태그) */}
                   <div className="prose prose-invert max-w-none text-foreground/90">
                     <ReactMarkdown
                       remarkPlugins={[remarkGfm]}
@@ -520,9 +531,10 @@ export default function Home() {
                   )}
                 </>
               ) : (
-                // showReport=true 이지만 adviceResult가 아직 없을 때
                 <div className="text-sm text-muted-foreground">
-                  아직 리포트 데이터가 없습니다. 다시 시도해 주세요.
+                  {error
+                    ? error
+                    : "아직 리포트 데이터가 없습니다. 다시 시도해 주세요."}
                 </div>
               )}
             </Card>
