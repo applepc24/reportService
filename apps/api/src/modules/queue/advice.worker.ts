@@ -56,7 +56,7 @@ import {
         },
         {
           connection: this.redis.duplicate(),
-          concurrency: 2,
+          concurrency: 5,
           limiter: {
             max: 10,
             duration: 60_000

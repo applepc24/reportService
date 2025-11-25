@@ -1,18 +1,16 @@
 // src/modules/queue/queue.module.ts
-import { Module, Global, forwardRef } from "@nestjs/common";
+import { Module, Global } from "@nestjs/common";
 import { ConfigModule, ConfigService } from "@nestjs/config";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
-import { AdviceWorker } from "./advice.worker";
-import { ReportModule } from "../report/report.module";
 
 export const ADVICE_QUEUE = "advice-queue";
+export const RAG_SAVE_QUEUE = "rag-save-queue";
 
 @Global()
 @Module({
   imports: [
     ConfigModule, // ✅ ConfigService 쓸거면 ConfigModule import
-    forwardRef(() => ReportModule), // ✅ 순환참조 끊기
   ],
   providers: [
     {
@@ -40,13 +38,27 @@ export const ADVICE_QUEUE = "advice-queue";
             removeOnComplete: { age: 60 * 10, count: 1000 }, // 10분 or 1000개까지 유지
             removeOnFail: { age: 60 * 60, count: 1000 }, // 실패는 1시간 유지
             attempts: 3,
-            backoff: { type: "exponential", delay: 5e000 },
+            backoff: { type: "exponential", delay: 5 },
+          },
+        });
+      },
+      inject: ["BULLMQ_REDIS"],
+    },
+    {
+      provide: "RAG_SAVE_QUEUE",
+      useFactory: (redis: IORedis) => {
+        return new Queue(RAG_SAVE_QUEUE, {
+          connection: redis,
+          defaultJobOptions: {
+            removeOnComplete: true,
+            attempts: 3,
+            backoff: { type: "exponential", delay: 2000 },
           },
         });
       },
       inject: ["BULLMQ_REDIS"],
     },
   ],
-  exports: ["BULLMQ_REDIS", "ADVICE_QUEUE"],
+  exports: ["BULLMQ_REDIS", "ADVICE_QUEUE", "RAG_SAVE_QUEUE"],
 })
 export class QueueModule {}

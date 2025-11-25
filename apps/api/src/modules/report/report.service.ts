@@ -41,14 +41,20 @@ import {
   KNOWN_TREND_AREAS,
   normalizeTrendArea,
 } from "../../common/utils/area-normalizer";
+import { Inject } from "@nestjs/common";
+import { Queue } from "bullmq";
+import IORedis from "ioredis";
 
 @Injectable()
 export class ReportService {
   private openai: OpenAI;
   private modelName: string;
   private readonly logger = new Logger(ReportService.name);
+  private readonly RAG_CACHE_TTL_SEC = 60 * 60 * 24;
 
   constructor(
+    @Inject("BULLMQ_REDIS")
+    private readonly redis: IORedis,
     private readonly dongService: DongService,
     private readonly trafficService: TrafficService,
     private readonly storeService: StoreService,
@@ -60,7 +66,8 @@ export class ReportService {
     private readonly dongQuarterRepo: Repository<DongQuarterSummary>,
     private readonly trendDocsService: TrendDocsService,
     private readonly naverBlogService: NaverBlogService,
-    private readonly configService: ConfigService // 나중에 ReviewService, RAGService도 여기로 추가
+    private readonly configService: ConfigService, // 나중에 ReviewService, RAGService도 여기로 추가
+    @Inject("RAG_SAVE_QUEUE") private readonly ragSaveQueue: Queue
   ) {
     const apiKey = this.configService.get<string>("OPENAI_API_KEY");
     this.modelName =
@@ -380,6 +387,45 @@ export class ReportService {
     endTotal();
     return result;
   }
+
+  private makeRagCacheKey(params: {
+    dongId: number;
+    concept: string;
+    budgetLevel: string;
+    targetAge: string;
+    openHours: string;
+  }) {
+    const { dongId, concept, budgetLevel, targetAge, openHours } = params;
+
+    // key는 최대한 deterministic 하게
+    return [
+      "rag",
+      `dong:${dongId}`,
+      `concept:${concept}`,
+      `budget:${budgetLevel}`,
+      `age:${targetAge}`,
+      `hours:${openHours}`,
+    ].join("|");
+  }
+
+  private makeNaverQueryCacheKey(ragKey: string) {
+    // ragKey에서 파생
+    return `naverQuery|${ragKey}`;
+  }
+
+  private async getCacheJson<T>(key: string): Promise<T | null> {
+    const raw = await this.redis.get(key);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  private async setCacheJson<T>(key: string, value: T, ttlSec: number) {
+    await this.redis.set(key, JSON.stringify(value), "EX", ttlSec);
+  }
   // src/modules/report/report.service.ts 안에
 
   async generateReportText(report: ReportResponse): Promise<string> {
@@ -554,6 +600,16 @@ ${reportJson}
     options: AdviceOptions,
     question: string
   ): Promise<string> {
+    const dongId = report.dong.id;
+    const openHours = options.openHours ?? "저녁 시간대 중심";
+
+    const ragKey = this.makeRagCacheKey({
+      dongId,
+      concept: options.concept,
+      budgetLevel: options.budgetLevel,
+      targetAge: options.targetAge,
+      openHours,
+    });
     const endTotal = perfTimer("generateAdvice TOTAL");
 
     // 세부 타이머들은 try 안/밖 상관없이 “끝내는 함수”를 확보
@@ -613,57 +669,75 @@ ${reportJson}
 
       // --- 2) RAG 전용 try/catch ---
       try {
-        const endQueryLLM = perfTimer("RAG: buildNaverQueryWithLLM");
-        let naverQuery =
-          (await buildNaverQueryWithLLM(
-            this.openai,
-            this.modelName,
-            safeQuestion,
-            trendAreaKeyword,
-            this.logger
-          )) || "";
-        endQueryLLM();
+        const cached = await this.redis.get(ragKey);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          trendContextText = parsed.trendContextText ?? "";
+          trendDocsSummary = parsed.trendDocsSummary ?? "";
+          this.logger.log(`[CACHE HIT] ragKey=${ragKey}`);
+        } else {
+          this.logger.log(`[CACHE MISS] ragKey=${ragKey}`);
 
-        const endQueryFallback = perfTimer("RAG: fallback");
-        if (!naverQuery) {
-          naverQuery = buildNaverQueryFromQuestion(
+          const endQueryLLM = perfTimer("RAG: buildNaverQueryWithLLM");
+          let naverQuery =
+            (await buildNaverQueryWithLLM(
+              this.openai,
+              this.modelName,
+              safeQuestion,
+              trendAreaKeyword,
+              this.logger
+            )) || "";
+          endQueryLLM();
+
+          const endQueryFallback = perfTimer("RAG: fallback");
+          if (!naverQuery) {
+            naverQuery = buildNaverQueryFromQuestion(
+              safeQuestion,
+              trendAreaKeyword
+            );
+          }
+          endQueryFallback();
+
+          const endNaver = perfTimer("RAG: naver searchBlogs");
+          const blogResult = await this.naverBlogService.searchBlogs(
+            naverQuery
+          );
+          endNaver();
+
+          const endSave = perfTimer("RAG: saveFromNaverBlogs");
+          if (trendAreaKeyword && blogResult.items?.length) {
+            this.ragSaveQueue.add("save-trend-docs", {
+              trendAreaKeyword,
+              items: blogResult.items,
+            });
+          }
+          endSave();
+
+          const endHybrid = perfTimer("RAG: searchHybrid");
+          const trendDocs = await this.trendDocsService.searchHybrid(
             safeQuestion,
+            5,
+            20,
             trendAreaKeyword
           );
-        }
-        endQueryFallback();
+          endHybrid();
 
-        const endNaver = perfTimer("RAG: naver searchBlogs");
-        const blogResult = await this.naverBlogService.searchBlogs(naverQuery);
-        endNaver();
+          if (trendDocs?.length) {
+            trendDocsSummary = trendDocs
+              .slice(0, 3)
+              .map((d, i) => `(${i + 1}) [source: ${d.source}] ${d.content}`)
+              .join("\n");
 
-        const endSave = perfTimer("RAG: saveFromNaverBlogs");
-        if (trendAreaKeyword && blogResult.items?.length) {
-          await this.trendDocsService.saveFromNaverBlogs(
-            trendAreaKeyword,
-            blogResult.items
+            trendContextText = trendDocs
+              .map((d, i) => `#${i + 1} [${d.source}]\n${d.content}`)
+              .join("\n\n---\n\n");
+          }
+          await this.redis.set(
+            ragKey,
+            JSON.stringify({ trendContextText, trendDocsSummary }),
+            "EX",
+            60 * 30
           );
-        }
-        endSave();
-
-        const endHybrid = perfTimer("RAG: searchHybrid");
-        const trendDocs = await this.trendDocsService.searchHybrid(
-          safeQuestion,
-          5,
-          20,
-          trendAreaKeyword
-        );
-        endHybrid();
-
-        if (trendDocs?.length) {
-          trendDocsSummary = trendDocs
-            .slice(0, 3)
-            .map((d, i) => `(${i + 1}) [source: ${d.source}] ${d.content}`)
-            .join("\n");
-
-          trendContextText = trendDocs
-            .map((d, i) => `#${i + 1} [${d.source}]\n${d.content}`)
-            .join("\n\n---\n\n");
         }
       } catch (e) {
         console.warn("RAG 오류 → DB 데이터 위주로 조언합니다:", e);
@@ -859,6 +933,9 @@ ${reportJson}
     } finally {
       // ✅ 어떤 return/throw가 나도 TOTAL은 무조건 종료
       endTotal();
+      if (endPre) endPre = null;
+      if (endSlim) endSlim = null;
+      if (endFinalLLM) endFinalLLM = null;
     }
   }
 }

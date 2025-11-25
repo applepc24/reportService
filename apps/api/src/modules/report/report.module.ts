@@ -14,7 +14,6 @@ import { FacilityModule } from "../facility/facility.module";
 import { DongQuarterSummary } from "../summary/entities/dong_quarter_summary";
 import { TrendDocsModule } from "../trend-docs/trend-docs.module";
 import { NaverBlogModule } from "../naver-blog/naver-blog.module";
-import { AdviceWorker } from "../queue/advice.worker";
 import { QueueModule } from "../queue/queue.module";
 
 @Module({
@@ -34,6 +33,7 @@ import { QueueModule } from "../queue/queue.module";
     QueueModule,
   ],
   controllers: [ReportController],
-  providers: [ReportService, AdviceWorker],
+  providers: [ReportService],
+  exports: [ReportService],
 })
 export class ReportModule {}
