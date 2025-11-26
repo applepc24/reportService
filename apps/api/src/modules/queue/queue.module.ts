@@ -32,7 +32,7 @@ export const RAG_SAVE_QUEUE = "rag-save-queue";
 
         // ✅ ElastiCache(전송 암호화=ON)일 때 TLS 사용
         if (tlsEnabled) {
-          options.tls = {}; // 기본 TLS 설정 (인증서는 VPC 내부라 기본으로 OK)
+          options.tls = { rejectUnauthorized: false }; // 기본 TLS 설정 (인증서는 VPC 내부라 기본으로 OK)
         }
 
         return new IORedis(options);
