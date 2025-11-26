@@ -98,7 +98,7 @@ export async function requestAdviceAsync(
 
   const jobId = queued.jobId;
   const intervalMs = opts?.intervalMs ?? 1500;
-  const maxWaitMs = opts?.maxWaitMs ?? 60_000;
+  const maxWaitMs = opts?.maxWaitMs ?? 100_000;
   const startedAt = Date.now();
 
   // 2) 폴링하면서 completed 될 때까지 기다렸다가 최종 AdviceResponse 반환
