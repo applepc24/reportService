@@ -13,5 +13,19 @@ services:
     volumes:
       - db_data:/var/lib/postgresql/data
 
+ services:
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+    image: infra-api
+    container_name: pubinsight-api
+    env_file:
+      - ../apps/api/.env
+    depends_on:
+      - db
+    ports:
+      - "3000:3000"
+
 volumes:
   db_data:
