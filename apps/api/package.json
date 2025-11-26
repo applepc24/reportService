@@ -23,7 +23,7 @@
     "@nestjs/platform-express": "^11.1.8",
     "@nestjs/typeorm": "^11.0.0",
     "axios": "^1.13.2",
-    "bullmq": "^5.64.1",
+    "bullmq": "^5.65.0",
     "ioredis": "^5.8.2",
     "openai": "^6.8.1",
     "pg": "^8.16.3",
