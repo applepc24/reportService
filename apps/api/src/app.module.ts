@@ -14,6 +14,7 @@ import { NaverBlogModule } from './modules/naver-blog/naver-blog.module';
 import { HealthModule } from './modules/health/health.module';
 import { QueueModule } from "./modules/queue/queue.module";
 import { QueueWorkerModule } from "./modules/queue/queue-worker.module";
+import { RentInfoModule } from "./modules/rent-info/rent-info.module";
 
 @Module({
   imports: [
@@ -33,7 +34,8 @@ import { QueueWorkerModule } from "./modules/queue/queue-worker.module";
     NaverBlogModule,
     HealthModule,
     QueueModule,
-    QueueWorkerModule, 
+    QueueWorkerModule,
+    RentInfoModule,
   ],
 })
 export class AppModule {}

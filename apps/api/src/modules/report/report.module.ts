@@ -15,6 +15,7 @@ import { DongQuarterSummary } from "../summary/entities/dong_quarter_summary";
 import { TrendDocsModule } from "../trend-docs/trend-docs.module";
 import { NaverBlogModule } from "../naver-blog/naver-blog.module";
 import { QueueModule } from "../queue/queue.module";
+import { RentInfoModule } from "../rent-info/rent-info.module";
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { QueueModule } from "../queue/queue.module";
     TrendDocsModule,
     NaverBlogModule,
     QueueModule,
+    RentInfoModule,
   ],
   controllers: [ReportController],
   providers: [ReportService],
