@@ -3,6 +3,10 @@
 **1인 술집 창업자를 위한** 상권·매출·트래픽 지표 + **Trend RAG(Agent)** + AI 조언을 결합해  
 “내가 이 동네에 술집을 내면 어떨지”를 **한 페이지 리포트**로 만들어주는 서비스입니다.
 
+✅ 핵심 설계: **LLM(20~40s)을 API에서 분리(BullMQ+Worker)** → API는 **즉시 jobId 응답**  
+✅ 반복 비용 최적화: **RAG 캐싱(Redis)** + TrendDocs 중복 저장 최소화  
+✅ 검증: k6 부하 테스트에서 **VU 30 / http_req_failed 0% / HTTP 3–7ms**
+
 - Frontend: Next.js (Wizard UI)
 - Backend: NestJS (Report API + Worker)
 - Infra: AWS EC2 + RDS(PostgreSQL) + Redis
@@ -15,10 +19,23 @@
 - https://report-service-ebon.vercel.app/
 - API Health: `GET /health`
 
+**Quick Try**
+1) 행정동 검색 → 컨셉/예산/연령 입력 → 질문 작성  
+2) `리포팅 뽑아보기` → jobId 기반으로 결과가 완료될 때까지 자동 Polling
+
 ---
 ## Architecture (High-level)
 
 ![Architecture](docs/snapreport.drawio.png)
+
+**Flow**
+- Next.js UI → `POST /report/advice` → (즉시) `{ jobId }`
+- UI → `GET /report/advice/:jobId` Polling
+- NestJS Worker → BullMQ job 처리
+  - 상권 지표 조회(PostgreSQL/RDS)
+  - Trend RAG Agent 실행(Naver → embed/save → hybrid search)
+  - OpenAI로 최종 조언 생성
+- 결과/중간 산출물은 Redis(Queue/Cache)로 재사용
 ---
 ## Key Features
 
@@ -48,6 +65,10 @@
 3. 문서 저장 + 임베딩(RAG 저장)
 4. Hybrid Search로 관련 문서만 리트리브
 5. LLM이 최종 조언 생성
+
+ **Problem:** LLM 호출(20~40s)이 API 스레드를 점유해 타임아웃/UX 저하 발생  
+**Solution:** BullMQ로 비동기 job 처리 + API는 jobId 즉시 응답  
+**Result:** HTTP latency는 ms 수준 유지, 느린 작업은 Worker에서 격리
 
 ### 4) Async Job Queue (BullMQ) + Worker
 - API는 즉시 응답하고, 오래 걸리는 작업은 Worker에서 처리합니다.
@@ -207,5 +228,27 @@ LLM ON 환경에서는 동시 요청이 커질수록 **대기열 누적 → E2E 
 - 캐시 HIT 시: RAG 재계산 회피(로그에서 `[CACHE HIT] ragKey=...` 확인)
 
 > 참고: 최종 E2E는 여전히 LLM 응답시간이 지배하지만, **RAG 비용/지연을 안정적으로 제거**해 변동성을 줄였습니다.
+
+
+
+## Run Locally
+
+### 1) Backend (NestJS)
+```bash
+cd apps/api
+cp .env.example .env
+npm install
+npm run dev
+
+### 1) Frontend (NeXtJS)
+
+cd apps/web
+cp .env.example .env
+npm install
+npm run dev
+
+
+
+
 
 
