@@ -16,7 +16,10 @@
 - API Health: `GET /health`
 
 ---
+## Architecture (High-level)
 
+![Architecture](docs/snapreport.drawio.png)
+---
 ## Key Features
 
 ### 1) Wizard 기반 리포트 생성 UX
@@ -55,11 +58,6 @@
 - 실제 로그에서 `[CACHE HIT] ragKey=...` 확인 가능
 
 ---
-
-## Architecture (High-level)
-
-![Architecture](docs/snapreport.drawio.png)
-
 - DB: PostgreSQL(RDS), 테이블: `dong`, `traffic_metrics`, `store_metrics`, `sales_metrics`, `facility_metrics`, `ta_change_metrics`, `poi_pub`, `review`, `trend_docs` 등
 
 ---
@@ -209,4 +207,5 @@ LLM ON 환경에서는 동시 요청이 커질수록 **대기열 누적 → E2E 
 - 캐시 HIT 시: RAG 재계산 회피(로그에서 `[CACHE HIT] ragKey=...` 확인)
 
 > 참고: 최종 E2E는 여전히 LLM 응답시간이 지배하지만, **RAG 비용/지연을 안정적으로 제거**해 변동성을 줄였습니다.
+
 
