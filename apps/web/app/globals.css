@@ -8,23 +8,26 @@ All colors MUST be HSL.
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    /* 배경: 약간 크림색 */
+    --background: 40 33% 97%; /* hsl(40 33% 97%) */
+
+    /* 글자색: 너무 검정 말고 짙은 남색 느낌 */
+    --foreground: 222 47% 11%; /* hsl(222 47% 11%) */
 
     --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card-foreground: 222 47% 11%;
 
     --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
+    --popover-foreground: 222 47% 11%;
 
-    /* Instagram-inspired gradient colors */
-    --primary: 268 83% 58%; /* Purple #5B2CFF */
+    /* 나머지는 그대로 두고, 필요하면 천천히 손보기 */
+    --primary: 268 83% 58%;
     --primary-foreground: 0 0% 100%;
 
-    --secondary: 338 100% 62%; /* Pink #FF3B81 */
+    --secondary: 338 100% 62%;
     --secondary-foreground: 0 0% 100%;
 
-    --accent: 28 100% 64%; /* Orange #FFB347 */
+    --accent: 28 100% 64%;
     --accent-foreground: 0 0% 100%;
 
     --muted: 220 13% 91%;
@@ -39,16 +42,14 @@ All colors MUST be HSL.
 
     --radius: 1rem;
 
-    /* Custom gradient colors */
     --gradient-purple: 268 83% 58%;
     --gradient-pink: 338 100% 62%;
     --gradient-orange: 28 100% 64%;
-    
-    /* Surface colors */
-    --surface: 0 0% 100%;
-    --surface-foreground: 222.2 84% 4.9%;
 
-    --sidebar-background: 0 0% 98%;
+    --surface: 0 0% 100%;
+    --surface-foreground: 222 47% 11%;
+
+    --sidebar-background: 40 33% 96%;
     --sidebar-foreground: 240 5.3% 26.1%;
     --sidebar-primary: 240 5.9% 10%;
     --sidebar-primary-foreground: 0 0% 98%;
@@ -59,14 +60,15 @@ All colors MUST be HSL.
   }
 
   .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
+    /* 다크 모드 배경도 살짝만 소프트하게 */
+    --background: 222 47% 11%;
+    --foreground: 210 40% 96%;
 
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
+    --card: 222 47% 14%;
+    --card-foreground: 210 40% 96%;
 
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
+    --popover: 222 47% 14%;
+    --popover-foreground: 210 40% 96%;
 
     --primary: 268 83% 58%;
     --primary-foreground: 0 0% 100%;
@@ -86,15 +88,15 @@ All colors MUST be HSL.
     --border: 217.2 32.6% 17.5%;
     --input: 217.2 32.6% 17.5%;
     --ring: 268 83% 58%;
-    
+
     --gradient-purple: 268 83% 58%;
     --gradient-pink: 338 100% 62%;
     --gradient-orange: 28 100% 64%;
-    
-    --surface: 222.2 84% 4.9%;
-    --surface-foreground: 210 40% 98%;
-    
-    --sidebar-background: 240 5.9% 10%;
+
+    --surface: 222 47% 14%;
+    --surface-foreground: 210 40% 96%;
+
+    --sidebar-background: 222 47% 9%;
     --sidebar-foreground: 240 4.8% 95.9%;
     --sidebar-primary: 224.3 76.3% 48%;
     --sidebar-primary-foreground: 0 0% 100%;

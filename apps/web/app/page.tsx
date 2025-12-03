@@ -1,6 +1,6 @@
 "use client"; // ← 이 줄만 추가하면 됩니다!
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Card } from "@/components/ui/card";
 import { Search } from "lucide-react";
-import { requestAdviceAsync, AdviceResponse } from "@/lib/api";
+import { getAdviceResult, AdviceResponse, queueAdviceJob } from "@/lib/api";
 
 type DongOption = {
   id: number;
@@ -59,9 +59,151 @@ export default function Home() {
   const [showReport, setShowReport] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [dongOptions, setDongOptions] = useState<DongOption[]>([]);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [stage, setStage] = useState<string>("idle");
+  const [streamText, setStreamText] = useState<string>("");
+  const [streamStatus, setStreamStatus] = useState<
+    "idle" | "streaming" | "done" | "error" | "stopped"
+  >("idle");
+
+  const esRef = useRef<EventSource | null>(null);
+  const lastSeqRef = useRef<number>(0);
+
+  useEffect(() => {
+    return () => closeStream();
+  }, []);
 
   const [adviceResult, setAdviceResult] = useState<AdviceResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const stageLabel = (s: string) => {
+    switch (s) {
+      case "subscribed":
+        return "연결됨";
+      case "start":
+        return "작업 시작";
+      case "fetch_report":
+        return "리포트 데이터 수집 중";
+      case "fetch_report_done":
+        return "리포트 데이터 수집 완료";
+      case "generate_advice":
+        return "조언 작성 중(스트리밍)";
+      case "generate_advice_done":
+        return "조언 작성 마무리";
+      case "stopped":
+        return "사용자가 중지함";
+      case "error":
+        return "오류 발생";
+      default:
+        return s || "진행 중";
+    }
+  };
+  const closeStream = useCallback(() => {
+    esRef.current?.close();
+    esRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    return () => closeStream();
+  }, [closeStream]);
+
+  const fetchFinalResult = async (jid: string): Promise<AdviceResponse> => {
+    // done 직후 GET이 아주 잠깐 늦을 수 있어서 2~3초만 가볍게 재시도
+    const deadline = Date.now() + 3000;
+    while (true) {
+      const r = await getAdviceResult(jid);
+      if (r.status === "completed" && r.result) return r.result;
+      if (r.status === "failed")
+        throw new Error(r.failedReason ?? "조언 생성 실패");
+      if (Date.now() > deadline)
+        throw new Error("완료 결과를 불러오지 못했습니다(타임아웃).");
+      await new Promise((x) => setTimeout(x, 300));
+    }
+  };
+
+  const openStream = (jid: string) => {
+    closeStream();
+
+    // 브라우저에서는 API_BASE가 "/api"였지? SSE도 동일하게 프록시로 태우자
+    const url = `/api/report/advice/${jid}/stream`;
+    const es = new EventSource(url);
+    esRef.current = es;
+
+    setStreamStatus("streaming");
+
+    es.addEventListener("progress", (ev: any) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data?.stage) setStage(data.stage);
+      } catch {}
+    });
+
+    es.addEventListener("delta_snapshot", (ev: any) => {
+      try {
+        const data = JSON.parse(ev.data);
+        const seq = Number(data?.seq ?? 0);
+        const text = typeof data?.text === "string" ? data.text : "";
+
+        if (text && seq >= lastSeqRef.current) {
+          lastSeqRef.current = seq;
+          setStreamText(text); // ✅ replace
+        }
+      } catch {}
+    });
+
+    es.addEventListener("delta", (ev: any) => {
+      try {
+        const data = JSON.parse(ev.data);
+        const seq = Number(data?.seq ?? 0);
+        const text = typeof data?.text === "string" ? data.text : "";
+
+        if (text && seq > lastSeqRef.current) {
+          lastSeqRef.current = seq;
+          setStreamText((prev) => prev + text); // ✅ append
+        }
+      } catch {}
+    });
+
+    es.addEventListener("done", async () => {
+      try {
+        setStreamStatus("done");
+        closeStream();
+
+        const final = await fetchFinalResult(jid);
+        setAdviceResult(final); // ✅ 최종 확정(places 포함)
+        setIsLoading(false);
+      } catch (e: any) {
+        setStreamStatus("error");
+        setError(e?.message ?? "완료 처리 중 오류");
+        setIsLoading(false);
+      }
+    });
+
+    // 서버가 event: error 를 보내는 경우
+    es.addEventListener("error", (ev: any) => {
+      // 네트워크 에러도 여기로 올 수 있어서 data 파싱 가능한지로 구분
+      if (typeof ev?.data === "string") {
+        try {
+          const data = JSON.parse(ev.data);
+          setError(data?.detail ?? data?.message ?? "스트리밍 오류");
+        } catch {
+          setError("스트리밍 오류");
+        }
+        setStreamStatus("error");
+        closeStream();
+        setIsLoading(false);
+      }
+    });
+
+    // 진짜 네트워크 끊김
+    es.onerror = () => {
+      // 여기선 즉시 종료만 하고, 필요하면 "폴링 복구"로 이어갈 수 있음
+      setError("SSE 연결이 끊겼습니다. (네트워크/프록시 확인)");
+      setStreamStatus("error");
+      closeStream();
+      setIsLoading(false);
+    };
+  };
 
   useEffect(() => {
     // 검색어 없으면 리스트 비우기
@@ -89,7 +231,6 @@ export default function Home() {
     const element = document.getElementById(id);
     element?.scrollIntoView({ behavior: "smooth" });
   };
-
   const handleGenerateReport = async () => {
     if (!selectedDongId) {
       setError("먼저 창업할 동네를 선택해 주세요.");
@@ -105,40 +246,63 @@ export default function Home() {
     setError(null);
     setAdviceResult(null);
 
-    try {
-      // ✅ requestAdviceAsync가 큐 넣고 + 폴링까지 해서
-      // 최종 AdviceResponse를 바로 돌려줌
-      const result = await requestAdviceAsync(
-        {
-          dongId: selectedDongId,
-          concept: barType,
-          budgetLevel: capital,
-          targetAge,
-          openHours: "저녁 시간대 중심",
-          question: userQuestion,
-        },
-        {
-          intervalMs: 1500,
-          maxWaitMs: 60_000,
-          onTick: (status) => {
-            // 필요하면 로딩 UI에 표시만
-            console.log("poll status:", status);
-          },
-        }
-      );
+    setTimeout(() => scrollToSection("report-section"), 0);
 
-      setAdviceResult(result);
-      setSelectedDistrict(result.report.dong.name);
-      scrollToSection("report-section");
+    // ✅ 스트리밍용 상태 초기화
+    setStreamText("");
+    setStage("idle");
+    setStreamStatus("idle");
+    lastSeqRef.current = 0;
+
+    try {
+      const jid = await queueAdviceJob({
+        dongId: selectedDongId,
+        concept: barType,
+        budgetLevel: capital,
+        targetAge,
+        openHours: "저녁 시간대 중심",
+        question: userQuestion,
+      });
+
+      setJobId(jid);
+      setStage("subscribed"); // UI 선반영(서버도 subscribed 줌)
+      openStream(jid); // ✅ SSE 시작
     } catch (e: any) {
       console.error(e);
-      setError(
-        e?.message ??
-          "리포트를 생성하는 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
-      );
-    } finally {
+      setError(e?.message ?? "리포트를 생성하는 중 오류가 발생했습니다.");
       setIsLoading(false);
     }
+  };
+
+  const showBanner = streamStatus !== "idle" && streamStatus !== "done";
+  const bannerTitle =
+    streamStatus === "stopped"
+      ? "중지됨"
+      : streamStatus === "error"
+      ? "오류"
+      : "생성 중";
+
+  const handleStop = async () => {
+    // 1) 프론트: 즉시 끊고 "멈춤" 상태
+    setStreamStatus("stopped");
+    setIsLoading(false);
+    closeStream();
+
+    // 2) 백엔드: best-effort cancel (엔드포인트 없으면 이 부분은 나중에)
+    if (!jobId) return;
+    try {
+      await fetch(`/api/report/advice/${jobId}/cancel`, { method: "POST" });
+    } catch {
+      // cancel이 아직 없거나 실패해도 UX는 "멈춤" 유지
+    }
+  };
+
+  const handleRetry = async () => {
+    // 새 jobId로 다시 시작 (A: 기존 텍스트 보존을 원하면 streamText를 다른 state에 저장하고 비우지 마)
+    closeStream();
+    setStreamStatus("idle");
+    setIsLoading(false);
+    await handleGenerateReport();
   };
 
   return (
@@ -160,6 +324,50 @@ export default function Home() {
           </div>
         </div>
       </nav>
+
+      {showBanner && (
+        <div className="fixed top-[72px] left-0 right-0 z-[70]">
+          <div className="mx-auto max-w-4xl px-6">
+            <div className="rounded-2xl bg-surface/95 backdrop-blur border border-border shadow-lg px-4 py-3 flex items-center justify-between">
+              <div className="text-sm">
+                <span className="font-semibold text-primary">
+                  {bannerTitle}
+                </span>
+                <span className="text-muted-foreground">
+                  {" "}
+                  · {stageLabel(stage)}
+                </span>
+              </div>
+
+              <div className="flex gap-2">
+                {/* ✅ streaming일 때만 '중지' 노출 */}
+                {streamStatus === "streaming" && (
+                  <Button variant="outline" size="sm" onClick={handleStop}>
+                    ⏹ 중지
+                  </Button>
+                )}
+
+                {/* ✅ stopped/error 상태면 "계속 받기"로 같은 jobId 스트림 재연결 */}
+                {(streamStatus === "stopped" || streamStatus === "error") &&
+                  jobId && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => openStream(jobId)}
+                    >
+                      ▶ 계속 받기
+                    </Button>
+                  )}
+
+                {/* ✅ 언제든 재시도 가능 */}
+                <Button variant="secondary" size="sm" onClick={handleRetry}>
+                  ↻ 다시 시도
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Hero Section */}
       <section className="min-h-screen flex items-center justify-center px-6 pt-20">
@@ -437,126 +645,121 @@ export default function Home() {
         >
           <div className="max-w-4xl w-full mx-auto">
             <Card className="p-8 md:p-12 animate-slide-up bg-surface/95 backdrop-blur border-none shadow-2xl">
-              {isLoading ? (
-                // 🔄 로딩 스켈레톤 그대로 사용
+              {/** ✅ streamedAdvice 우선, 없으면 adviceResult.advice */}
+              {(() => {
+                const adviceText = streamText || adviceResult?.advice || "";
 
-                <div className="space-y-6">
-                  <div className="h-8 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
-                  <div className="h-12 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
-                  <div className="space-y-3">
-                    <div className="h-6 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
-                    <div className="h-6 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
-                    <div className="h-6 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
-                  </div>
-                </div>
-              ) : adviceResult ? (
-                <>
-                  <div className="text-sm text-primary font-semibold mb-2">
-                    AI 상권 리포트
-                  </div>
-                  <h2 className="text-4xl font-bold mb-6">
-                    {adviceResult?.report?.dong?.name ?? "선택한 동네"} 술집
-                    상권 분석 & 창업 조언
-                  </h2>
+                if (isLoading && !adviceText) {
+                  // 🔄 스트리밍 텍스트가 아직 0글자면 스켈레톤
+                  return (
+                    <div className="space-y-6">
+                      <div className="h-8 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
+                      <div className="h-12 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
+                      <div className="space-y-3">
+                        <div className="h-6 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
+                        <div className="h-6 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
+                        <div className="h-6 bg-gradient-to-r from-muted via-muted/50 to-muted rounded animate-shimmer bg-[length:1000px_100%]" />
+                      </div>
+                    </div>
+                  );
+                }
 
-                  <div className="prose prose-invert max-w-none text-foreground/90">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        a: (props) => (
-                          <a
-                            {...props}
-                            className="text-sky-300 underline underline-offset-2 hover:text-sky-200"
-                            target="_blank"
-                            rel="noreferrer"
-                          />
-                        ),
-                        h2: (props) => (
-                          <h2
-                            {...props}
-                            className="text-2xl font-bold mt-6 mb-3 text-primary"
-                          />
-                        ),
-                        h3: (props) => (
-                          <h3
-                            {...props}
-                            className="text-xl font-semibold mt-4 mb-2 text-secondary"
-                          />
-                        ),
-                        li: (props) => (
-                          <li {...props} className="leading-relaxed" />
-                        ),
-                        p: (props) => (
-                          <p {...props} className="leading-relaxed" />
-                        ),
-                      }}
-                    >
-                      {toFriendlyLinks(adviceResult.advice)}
-                    </ReactMarkdown>
-                  </div>
+                if (adviceText) {
+                  return (
+                    <>
+                      <div className="text-sm text-primary font-semibold mb-2">
+                        AI 상권 리포트
+                      </div>
+                      <h2 className="text-4xl font-bold mb-6">
+                        {adviceResult?.report?.dong?.name ?? "선택한 동네"} 술집
+                        상권 분석 & 창업 조언
+                      </h2>
 
-                  {/* 주변 실제 술집 예시 */}
-                  {adviceResult.places.length > 0 && (
-                    <div className="mt-8 border-t border-border pt-6">
-                      <h3 className="text-lg font-semibold mb-3 text-primary">
-                        주변 실제 술집 예시 (카카오)
-                      </h3>
-                      <ul className="space-y-2 text-sm text-foreground/90">
-                        {adviceResult.places.map((p, idx) => (
-                          <li key={idx}>
-                            <span className="font-medium">{p.name}</span>
-                            <span className="ml-1 text-muted-foreground">
-                              ({p.category})
-                            </span>
-                            {p.url && (
+                      <div className="prose prose-invert max-w-none text-foreground/90">
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          components={{
+                            a: (props) => (
                               <a
-                                href={p.url}
+                                {...props}
+                                className="text-sky-300 underline underline-offset-2 hover:text-sky-200"
                                 target="_blank"
                                 rel="noreferrer"
-                                className="ml-2 text-sky-300 underline"
-                              >
-                                지도 보기
-                              </a>
-                            )}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
+                              />
+                            ),
+                            h2: (props) => (
+                              <h2
+                                {...props}
+                                className="text-2xl font-bold mt-6 mb-3 text-primary"
+                              />
+                            ),
+                            h3: (props) => (
+                              <h3
+                                {...props}
+                                className="text-xl font-semibold mt-4 mb-2 text-secondary"
+                              />
+                            ),
+                            li: (props) => (
+                              <li {...props} className="leading-relaxed" />
+                            ),
+                            p: (props) => (
+                              <p {...props} className="leading-relaxed" />
+                            ),
+                          }}
+                        >
+                          {toFriendlyLinks(adviceText)}
+                        </ReactMarkdown>
+                      </div>
 
-                  {error && (
-                    <div className="mt-4 text-sm text-red-400 bg-red-500/10 px-4 py-2 rounded-lg">
-                      {error}
-                    </div>
-                  )}
-                </>
-              ) : (
-                <div className="text-sm text-muted-foreground">
-                  {error
-                    ? error
-                    : "아직 리포트 데이터가 없습니다. 다시 시도해 주세요."}
-                </div>
-              )}
+                      {/* ✅ places는 최종 adviceResult가 생겼을 때만 표시 */}
+                      {!!adviceResult?.places?.length && (
+                        <div className="mt-8 border-t border-border pt-6">
+                          <h3 className="text-lg font-semibold mb-3 text-primary">
+                            주변 실제 술집 예시 (카카오)
+                          </h3>
+                          <ul className="space-y-2 text-sm text-foreground/90">
+                            {adviceResult.places.map((p, idx) => (
+                              <li key={idx}>
+                                <span className="font-medium">{p.name}</span>
+                                <span className="ml-1 text-muted-foreground">
+                                  ({p.category})
+                                </span>
+                                {p.url && (
+                                  <a
+                                    href={p.url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="ml-2 text-sky-300 underline"
+                                  >
+                                    지도 보기
+                                  </a>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {error && (
+                        <div className="mt-4 text-sm text-red-400 bg-red-500/10 px-4 py-2 rounded-lg">
+                          {error}
+                        </div>
+                      )}
+                    </>
+                  );
+                }
+
+                return (
+                  <div className="text-sm text-muted-foreground">
+                    {error
+                      ? error
+                      : "아직 리포트 데이터가 없습니다. 다시 시도해 주세요."}
+                  </div>
+                );
+              })()}
             </Card>
           </div>
         </section>
-      )}
-      {isLoading && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 backdrop-blur-sm">
-          <div className="bg-surface/95 rounded-2xl px-8 py-6 shadow-xl text-center max-w-sm mx-4">
-            <div className="mb-4 flex justify-center">
-              <div className="h-10 w-10 rounded-full border-4 border-surface/40 border-t-primary animate-spin" />
-            </div>
-            <h3 className="text-xl font-semibold mb-2">
-              리포트를 만들고 있어요
-            </h3>
-            <p className="text-sm text-muted-foreground leading-relaxed">
-              동별 상권 데이터와 AI 분석을 조합해서
-              <br />
-              맞춤 리포트를 생성하는 중입니다.
-            </p>
-          </div>
-        </div>
       )}
     </div>
   );

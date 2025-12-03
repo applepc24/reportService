@@ -31,6 +31,8 @@ data/
 db_data/
 *.pid
 
+!apps/api/data/
+!apps/api/data/**
 # coverage & test outputs
 coverage/
 test-results/

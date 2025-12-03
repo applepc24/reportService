@@ -96,7 +96,8 @@ export class ReportService {
           properties: {
             dongName: {
               type: "string",
-              description: '조회할 동/가 이름. 예: "신당동", "을지로", "서초동"',
+              description:
+                '조회할 동/가 이름. 예: "신당동", "을지로", "서초동"',
             },
             budgetLevel: {
               type: "string",
@@ -109,7 +110,7 @@ export class ReportService {
           additionalProperties: false,
         },
       },
-    }
+    },
   ];
 
   constructor(
@@ -354,49 +355,72 @@ export class ReportService {
     trendAreaKeyword: string
   ): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam> {
     const fn = toolCall.function;
+    const toolName: string = fn?.name ?? "unknown";
 
-    if (fn.name === "search_trends") {
-      let args: SearchTrendsArgs;
+    const safeJsonParse = <T>(raw: any, fallback: T): T => {
       try {
-        args = JSON.parse(fn.arguments || "{}");
+        return JSON.parse(raw || "{}") as T;
       } catch (e) {
-        this.logger.error("search_trends args JSON parse error", e);
-        args = { query: trendAreaKeyword, areaHint: trendAreaKeyword, topK: 5 };
+        this.logger.error(`${toolName} args JSON parse error`, e as any);
+        return fallback;
       }
+    };
 
-      const query = args.query || trendAreaKeyword;
-      const areaHint = args.areaHint || trendAreaKeyword;
+    const okTool = (payload: any) => ({
+      role: "tool" as const,
+      tool_call_id: toolCall.id,
+      content: JSON.stringify({ ok: true, tool: toolName, ...payload }),
+    });
+
+    const errTool = (error: any, extra?: any) => ({
+      role: "tool" as const,
+      tool_call_id: toolCall.id,
+      content: JSON.stringify({
+        ok: false,
+        tool: toolName,
+        error: error?.message ?? String(error),
+        ...(extra ?? {}),
+      }),
+    });
+
+    // 1) search_trends
+    if (toolName === "search_trends") {
+      const args = safeJsonParse<SearchTrendsArgs>(fn.arguments, {
+        query: trendAreaKeyword,
+        areaHint: trendAreaKeyword,
+        topK: 5,
+      });
+
+      const query = (args.query || trendAreaKeyword || "").trim();
+      const areaHint = (args.areaHint || trendAreaKeyword || "").trim();
       const topK = args.topK ?? 5;
 
-      const docs = await this.trendDocsService.searchHybrid(
-        query,
-        topK,
-        20,
-        areaHint
-      );
-
-      const payload = {
-        docs,
-        usedQuery: query,
-        areaHint,
-      };
-
-      const toolMessage: OpenAI.Chat.Completions.ChatCompletionMessageParam = {
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(payload),
-      };
-
-      return toolMessage;
-    } else if (fn.name === "get_rent_info") {
-      // 🔹 임대/매매 정보 툴 호출 처리
-      let args: { dongName?: string; budgetLevel?: string };
       try {
-        args = JSON.parse(fn.arguments || "{}");
+        const docs = await this.trendDocsService.searchHybrid(
+          query,
+          topK,
+          20,
+          areaHint
+        );
+
+        return okTool({ docs, usedQuery: query, areaHint, topK });
       } catch (e) {
-        this.logger.error("get_rent_info args JSON parse error", e);
-        args = {};
+        // ✅ 여기서 절대 throw 하지 말고 tool 응답으로 반환
+        return errTool(e, {
+          docs: [],
+          usedQuery: query,
+          areaHint,
+          topK,
+        });
       }
+    }
+
+    // 2) get_rent_info
+    if (toolName === "get_rent_info") {
+      const args = safeJsonParse<{ dongName?: string; budgetLevel?: string }>(
+        fn.arguments,
+        {}
+      );
 
       const dongName = (args.dongName || trendAreaKeyword || "").trim();
       const budgetLevel = (args.budgetLevel || "").trim();
@@ -405,143 +429,44 @@ export class ReportService {
         `[AdviceAgent] 🔧 get_rent_info 호출: dong="${dongName}", budget="${budgetLevel}"`
       );
 
-      // 아직 CSV 연동 전이니까, RentInfoService는 간단한 mock을 돌려주도록 구현해둔 상태라고 가정
-      const rentSummary = await this.rentInfoService.getSummaryByDongName(
-        dongName
-      );
-
-      this.logger.log(
-        `[AdviceAgent] 🔧 get_rent_info 결과: hasData=${!!rentSummary}`
-      );
-
-      const payload = {
-        dongName,
-        budgetLevel,
-        rent: rentSummary,
-      };
-
-      const toolMessage: OpenAI.Chat.Completions.ChatCompletionMessageParam = {
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(payload),
-      };
-
-      return toolMessage;
-    }
-
-    // 미지원 도구일 경우 안전하게 에러 payload
-    const fallback: OpenAI.Chat.Completions.ChatCompletionMessageParam = {
-      role: "tool",
-      tool_call_id: toolCall.id,
-      content: JSON.stringify({
-        error: `Unknown tool: ${fn.name}`,
-      }),
-    };
-    return fallback;
-  }
-
-  private async runAdviceWithTools(args: {
-    systemPrompt: string;
-    userPrompt: string;
-    trendAreaKeyword: string;
-  }): Promise<string> {
-    const { systemPrompt, userPrompt, trendAreaKeyword } = args;
-
-    // 1) 기본 메시지 (system + user)
-    const baseMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-      {
-        role: "system",
-        content: systemPrompt,
-      },
-      {
-        role: "user",
-        content: userPrompt,
-      },
-    ];
-
-    // 2) 1차 호출: tool 사용 여부를 모델에 맡기기 (tool_choice: "auto")
-    const first = await this.openai.chat.completions.create({
-      model: this.modelName,
-      messages: baseMessages,
-      tools: this.adviceTools,
-      tool_choice: "auto",
-    });
-
-    const firstChoice = first.choices[0];
-    if (!firstChoice) {
-      this.logger.error("runAdviceWithTools: no choice in first completion");
-      return "";
-    }
-
-    const firstMsg = firstChoice.message as any;
-    const toolCalls = firstMsg.tool_calls;
-
-    // 2-1) 도구 호출이 없으면, 이 답변 그대로 사용
-    if (!toolCalls || toolCalls.length === 0) {
-      const content = firstMsg.content;
-      if (typeof content === "string") return content.trim();
-      // content가 array일 수도 있어서 방어적으로 처리
-      if (Array.isArray(content)) {
-        return content
-          .map((c: any) => c.text ?? "")
-          .join("\n")
-          .trim();
-      }
-      return "";
-    }
-
-    // 3) 도구 호출이 있다면, 각 toolCall을 처리해서 tool 메시지 생성
-    const toolMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
-      [];
-
-    for (const tc of toolCalls) {
       try {
-        const toolMsg = await this.handleAdviceToolCall(tc, trendAreaKeyword);
-        toolMessages.push(toolMsg);
+        const rentSummary = await this.rentInfoService.getSummaryByDongName(
+          dongName
+        );
+
+        this.logger.log(
+          `[AdviceAgent] 🔧 get_rent_info 결과: hasData=${!!rentSummary}`
+        );
+
+        return okTool({
+          dongName,
+          budgetLevel,
+          rent: rentSummary,
+        });
       } catch (e) {
-        this.logger.error("runAdviceWithTools: handleAdviceToolCall error", e);
+        return errTool(e, {
+          dongName,
+          budgetLevel,
+          rent: null,
+        });
       }
     }
 
-    // 4) 2차 호출: 기존 대화 + tool 응답들을 모두 전달해서 최종 답변 생성
-    const second = await this.openai.chat.completions.create({
-      model: this.modelName,
-      messages: [
-        ...baseMessages, // system + user
-        firstMsg, // tool_calls를 포함한 assistant 메시지
-        ...toolMessages, // role: "tool" 메시지들
-      ],
-    });
-
-    const secondChoice = second.choices[0];
-    if (!secondChoice) {
-      this.logger.error("runAdviceWithTools: no choice in second completion");
-      return "";
-    }
-
-    const secondMsg = secondChoice.message as any;
-    const finalContent = secondMsg.content;
-
-    if (typeof finalContent === "string") return finalContent.trim();
-    if (Array.isArray(finalContent)) {
-      return finalContent
-        .map((c: any) => c.text ?? "")
-        .join("\n")
-        .trim();
-    }
-    return "";
+    // 3) unknown tool
+    return errTool(new Error(`Unknown tool: ${toolName}`));
   }
+
+  
 
   // ReportService 클래스 안, handleAdviceToolCall 아래에 추가
   // 1) 리턴 타입부터 변경
   private async runAdviceCompletionWithTools(
     baseMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
-    trendAreaKeyword: string
+    trendAreaKeyword: string,
+    onDelta?: (text: string) => void | Promise<void>
   ): Promise<{ content: string; toolsUsed: string[] }> {
-    // 어떤 툴을 썼는지 모아둘 배열
     const toolsUsed: string[] = [];
 
-    // 1) 1차 호출: tools=adviceTools, tool_choice=auto
     const first = await this.openai.chat.completions.create({
       model: this.modelName,
       tools: this.adviceTools,
@@ -564,33 +489,25 @@ export class ReportService {
               toolCalls.map((tc: any) => ({
                 id: tc.id,
                 type: tc.type,
-                name: tc.function?.name, // function tool일 때만 존재
+                name: tc.function?.name,
               }))
             )
           : "none"
       }`
     );
 
-    // toolCalls 안에서 툴 이름 빼서 toolsUsed에 저장
     if (toolCalls && toolCalls.length > 0) {
       for (const tc of toolCalls as any[]) {
         const fnName = tc.function?.name as string | undefined;
-        if (fnName && !toolsUsed.includes(fnName)) {
-          toolsUsed.push(fnName);
-        }
+        if (fnName && !toolsUsed.includes(fnName)) toolsUsed.push(fnName);
       }
     }
 
-    // 2) tool 호출이 없으면, 그냥 이 답변을 그대로 사용
     if (!toolCalls || toolCalls.length === 0) {
       this.logger.log("[AdviceAgent] no tool_calls, return first content");
-      return {
-        content: firstChoice.message.content?.trim() ?? "",
-        toolsUsed,
-      };
+      return { content: firstChoice.message.content?.trim() ?? "", toolsUsed };
     }
 
-    // 3) tool_calls 있으면, 우리가 직접 실행해서 tool 메시지들 생성
     const toolMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
       [];
 
@@ -600,41 +517,85 @@ export class ReportService {
           toolCall,
           trendAreaKeyword
         );
-        toolMessages.push(toolMsg);
-      } catch (e) {
+
+        // ✅ 혹시 handle이 이상하게 빈 값 리턴해도 안전장치
+        if (!toolMsg) {
+          toolMessages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({
+              ok: false,
+              tool: toolCall.function?.name ?? "unknown",
+              error: "tool returned empty response",
+            }),
+          });
+        } else {
+          toolMessages.push(toolMsg);
+        }
+      } catch (e: any) {
         this.logger.error(
           `[AdviceAgent] tool execution error: ${toolCall.type}/${toolCall.id}`,
-          e as any
+          e?.stack ?? e
         );
-        // 에러가 나도 나머지 tool은 계속 시도
+
+        // ✅ 핵심: 실패해도 tool_call_id에 대한 tool 응답은 반드시 넣는다
+        toolMessages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify({
+            ok: false,
+            tool: toolCall.function?.name ?? "unknown",
+            error: e?.message ?? String(e),
+          }),
+        });
       }
     }
 
-    // 4) 2차 호출: tool 결과들을 포함해서 최종 답변 생성
-    const second = await this.openai.chat.completions.create({
+    // ✅ 2차 호출: stream:true
+    const stream = await this.openai.chat.completions.create({
       model: this.modelName,
       tools: this.adviceTools,
-      tool_choice: "none", // 더 이상 tool 호출 말고 최종 답만
+      tool_choice: "none",
+      stream: true, // ✅ 추가
       messages: [
-        ...baseMessages, // system + user
-        firstChoice.message, // 첫 번째 모델 메시지 (tool_calls 포함)
-        ...toolMessages, // 우리가 실행한 tool 결과들
+        ...baseMessages,
+        firstChoice.message, // tool_calls 포함된 assistant 메시지
+        ...toolMessages, // tool_call_id 전부 대응됨
       ],
     });
 
-    const secondChoice = second.choices[0];
-    if (!secondChoice) {
-      this.logger.warn("[AdviceAgent] second completion returned no choice");
-      return {
-        content: firstChoice.message.content?.trim() ?? "",
-        toolsUsed,
-      };
+    // ✅ delta 누적 + 실시간 콜백
+    let full = "";
+    let buf = "";
+    let lastFlush = Date.now();
+    const FLUSH_MS = 80;
+
+    const flush = async (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastFlush < FLUSH_MS) return;
+      if (!buf) return;
+      const out = buf;
+      buf = "";
+      lastFlush = now;
+      await onDelta?.(out);
+    };
+
+    for await (const chunk of stream as any) {
+      const delta = chunk?.choices?.[0]?.delta?.content;
+      if (typeof delta === "string" && delta.length > 0) {
+        full += delta;
+        buf += delta;
+        await flush(false);
+      }
+    }
+    await flush(true);
+
+    // 스트리밍인데 아무 것도 안 왔다면(매우 드묾) fallback
+    if (!full.trim()) {
+      this.logger.warn("[AdviceAgent] stream finished but no content");
     }
 
-    return {
-      content: secondChoice.message.content?.trim() ?? "",
-      toolsUsed,
-    };
+    return { content: full.trim(), toolsUsed };
   }
 
   // GET /report?dongId=1 에서 쓸 핵심 함수
@@ -946,7 +907,8 @@ ${reportJson}
   async generateAdvice(
     report: ReportResponse,
     options: AdviceOptions,
-    question: string
+    question: string,
+    onDelta?: (text: string) => void | Promise<void>
   ): Promise<string> {
     const dongId = report.dong.id;
     const openHours = options.openHours ?? "저녁 시간대 중심";
@@ -1315,7 +1277,8 @@ ${reportJson}
 
       const { content, toolsUsed } = await this.runAdviceCompletionWithTools(
         baseMessages,
-        trendAreaKeyword
+        trendAreaKeyword,
+        onDelta
       );
 
       endFinalLLM();

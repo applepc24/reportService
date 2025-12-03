@@ -141,3 +141,22 @@ export async function getAdviceResult(
 ): Promise<AdviceJobResultResponse> {
   return fetchJson<AdviceJobResultResponse>(`/report/advice/${jobId}`);
 }
+
+
+export async function queueAdviceJob(payload: AdviceRequest): Promise<string> {
+  const queued = await fetchJson<AdviceJobQueuedResponse>("/report/advice", {
+    method: "POST",
+    body: JSON.stringify({
+      dongId: payload.dongId,
+      options: {
+        budgetLevel: payload.budgetLevel,
+        concept: payload.concept,
+        targetAge: payload.targetAge,
+        openHours: payload.openHours,
+      },
+      question: payload.question ?? "",
+    }),
+  });
+
+  return queued.jobId;
+}
