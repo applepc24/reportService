@@ -8,7 +8,7 @@ const nextConfig = {
         source: "/api/:path*",
         destination: isDev
           ? "http://localhost:3000/:path*"
-          : "http://43.200.175.25:3000/:path*",
+          : "http://3.39.189.37:3000/:path*",
       },
     ];
   },
