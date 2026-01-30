@@ -88,6 +88,8 @@ export default function Home() {
         return "리포트 데이터 수집 완료";
       case "generate_advice":
         return "조언 작성 중(스트리밍)";
+      case "finalizing":
+        return "마무리 중(형식 검증/보정)";
       case "generate_advice_done":
         return "조언 작성 마무리";
       case "stopped":
@@ -133,8 +135,9 @@ export default function Home() {
 
     es.addEventListener("progress", (ev: any) => {
       try {
-        const data = JSON.parse(ev.data);
-        if (data?.stage) setStage(data.stage);
+        const payload = JSON.parse(ev.data);
+        const nextStage = payload?.stage ?? payload?.data?.stage; // ✅ 둘 다 대응
+        if (nextStage) setStage(nextStage);
       } catch {}
     });
 

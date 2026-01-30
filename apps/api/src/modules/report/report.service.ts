@@ -1,5 +1,5 @@
 // src/modules/report/report.service.ts
-import { Injectable, NotFoundException, Logger } from "@nestjs/common";
+import { Injectable, NotFoundException, Logger, Inject } from "@nestjs/common";
 import OpenAI from "openai";
 import { ConfigService } from "@nestjs/config";
 import { DongService } from "../dong/dong.service";
@@ -14,6 +14,8 @@ import { NaverBlogService } from "../naver-blog/naver-blog.service";
 import { perfTimer } from "../../common/utils/perTimer";
 import { toSlimReport } from "./slim-report.util";
 import { RentInfoService } from "../rent-info/rent-info.service";
+import { validateAdviceOutput } from "./advice-output.schema";
+import { createHash } from "crypto";
 import {
   isPerfFakeExternal,
   isPerfFakeLLM,
@@ -39,7 +41,6 @@ import {
   KNOWN_TREND_AREAS,
   normalizeTrendArea,
 } from "../../common/utils/area-normalizer";
-import { Inject } from "@nestjs/common";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 
@@ -47,6 +48,22 @@ type SearchTrendsArgs = {
   query: string;
   areaHint?: string;
   topK?: number;
+};
+
+type ToolState = {
+  counts: Record<string, number>;
+  memo: Record<string, any>;
+};
+
+type AdviceStageCb = (
+  stage: string,
+  meta?: Record<string, any>
+) => void | Promise<void>;
+
+type Citation = {
+  source: string;
+  url?: string;
+  quote?: string;
 };
 
 @Injectable()
@@ -350,9 +367,104 @@ export class ReportService {
       };
     });
   }
+
+  private makeTrendsToolCacheKey(params: {
+    query: string;
+    areaHint: string;
+    topK: number;
+  }) {
+    const raw = `q=${params.query}|a=${params.areaHint}|k=${params.topK}`;
+    const hash = createHash("sha1").update(raw).digest("hex");
+    return `rag:trends:${hash}`;
+  }
+
+  private async fetchTrendsForTool(params: {
+    query: string;
+    areaHint: string;
+    topK: number;
+  }) {
+    const { query, areaHint, topK } = params;
+
+    const TTL = 60 * 30; // 30분
+    const cacheKey = this.makeTrendsToolCacheKey({ query, areaHint, topK });
+
+    // 1) 캐시
+    const cached = await this.redis.get(cacheKey);
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        return { ...parsed, cacheHit: true, cacheKey };
+      } catch {
+        // 캐시가 깨졌으면 그냥 miss로 처리
+      }
+    }
+
+    // 2) 네이버 쿼리 생성 (LLM → fallback)
+    let naverQuery =
+      (await buildNaverQueryWithLLM(
+        this.openai,
+        this.modelName,
+        query, // ✅ safeQuestion 대신 "tool query"를 넣는다
+        areaHint,
+        this.logger
+      )) || "";
+
+    if (!naverQuery) {
+      naverQuery = buildNaverQueryFromQuestion(query, areaHint);
+    }
+
+    // 3) 네이버 검색
+    const blogResult = await this.naverBlogService.searchBlogs(naverQuery);
+
+    // 4) 저장은 큐로 (비동기 적재)
+    if (areaHint && blogResult.items?.length) {
+      this.ragSaveQueue.add("save-trend-docs", {
+        trendAreaKeyword: areaHint,
+        items: blogResult.items,
+      });
+    }
+
+    // 5) DB hybrid 검색 (임베딩 포함)
+    const docs = await this.trendDocsService.searchHybrid(
+      query,
+      topK,
+      20,
+      areaHint
+    );
+
+    // 6) summary/contextText 만들어 캐시
+    const trendDocsSummary = docs?.length
+      ? docs
+          .slice(0, 3)
+          .map(
+            (d: any, i: number) =>
+              `(${i + 1}) [source: ${d.source}] ${d.content}`
+          )
+          .join("\n")
+      : "";
+
+    const trendContextText = docs?.length
+      ? docs
+          .map((d: any, i: number) => `#${i + 1} [${d.source}]\n${d.content}`)
+          .join("\n\n---\n\n")
+      : "";
+
+    const payload = {
+      docs,
+      trendDocsSummary,
+      trendContextText,
+      naverQuery,
+    };
+
+    await this.redis.set(cacheKey, JSON.stringify(payload), "EX", TTL);
+
+    return { ...payload, cacheHit: false, cacheKey };
+  }
+
   private async handleAdviceToolCall(
     toolCall: any,
-    trendAreaKeyword: string
+    trendAreaKeyword: string,
+    toolState?: ToolState
   ): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam> {
     const fn = toolCall.function;
     const toolName: string = fn?.name ?? "unknown";
@@ -384,6 +496,7 @@ export class ReportService {
     });
 
     // 1) search_trends
+
     if (toolName === "search_trends") {
       const args = safeJsonParse<SearchTrendsArgs>(fn.arguments, {
         query: trendAreaKeyword,
@@ -395,22 +508,86 @@ export class ReportService {
       const areaHint = (args.areaHint || trendAreaKeyword || "").trim();
       const topK = args.topK ?? 5;
 
-      try {
-        const docs = await this.trendDocsService.searchHybrid(
-          query,
+      this.logger.log(
+        `[AdviceAgent] 🔧 search_trends 호출: q="${query}", area="${areaHint}", topK=${topK}`
+      );
+
+      // ✅ 기능: "같은 (query+areaHint+topK)"로 이미 tool을 실행했다면,
+      //         같은 run 안에서는 toolState.memo에서 바로 재사용(memo-hit)한다.
+      // ✅ 이유: LLM이 같은 tool을 반복 호출해도 외부 호출/DB 호출을 줄여서 비용/지연을 줄임.
+      const memoKey = this.makeTrendsToolCacheKey({ query, areaHint, topK });
+
+      const memoHit = toolState?.memo?.[memoKey];
+      if (memoHit) {
+        this.logger.log(
+          `[AdviceAgent] 🔧 search_trends memoHit=true docs=${
+            memoHit.docs?.length ?? 0
+          }`
+        );
+        return okTool({
+          docs: memoHit.docs ?? [],
+          usedQuery: query,
+          areaHint,
           topK,
-          20,
-          areaHint
+          cacheHit: true, // memo도 "캐시 히트"로 취급
+          cacheKey: memoHit.cacheKey ?? memoKey,
+          naverQuery: memoHit.naverQuery,
+          trendDocsSummary: memoHit.trendDocsSummary,
+          trendContextText: memoHit.trendContextText,
+          memoHit: true,
+          memoKey,
+        });
+      }
+
+      try {
+        // ✅ 기능: Redis 캐시(hit/miss) + 네이버 쿼리 생성 + 네이버 검색 + DB hybrid 검색까지 수행
+        const out = await this.fetchTrendsForTool({ query, areaHint, topK });
+
+        this.logger.log(
+          `[AdviceAgent] 🔧 search_trends 결과: cacheHit=${out.cacheHit} docs=${
+            out.docs?.length ?? 0
+          } naverQuery="${out.naverQuery ?? ""}"`
         );
 
-        return okTool({ docs, usedQuery: query, areaHint, topK });
+        // ✅ 기능: 이번 run에서 같은 요청이 다시 오면 재사용할 수 있도록 메모 저장
+        if (toolState?.memo) {
+          toolState.memo[memoKey] = out;
+        }
+
+        if (toolState?.memo) {
+          const prevBest = toolState.memo.__search_trends_best;
+          const prevLen = Array.isArray(prevBest?.docs)
+            ? prevBest.docs.length
+            : 0;
+          const nextLen = Array.isArray(out?.docs) ? out.docs.length : 0;
+
+          if (!prevBest || nextLen > prevLen) {
+            toolState.memo.__search_trends_best = out;
+          }
+        }
+
+        return okTool({
+          docs: out.docs ?? [],
+          usedQuery: query,
+          areaHint,
+          topK,
+          cacheHit: out.cacheHit,
+          cacheKey: out.cacheKey,
+          naverQuery: out.naverQuery,
+          trendDocsSummary: out.trendDocsSummary,
+          trendContextText: out.trendContextText,
+          memoHit: false,
+          memoKey,
+        });
       } catch (e) {
-        // ✅ 여기서 절대 throw 하지 말고 tool 응답으로 반환
+        // ✅ 기능: 절대 throw 하지 않고 tool 응답으로 에러를 반환해서
+        //         OpenAI tool_call 루프가 중단되지 않게 한다.
         return errTool(e, {
           docs: [],
           usedQuery: query,
           areaHint,
           topK,
+          memoKey,
         });
       }
     }
@@ -456,119 +633,248 @@ export class ReportService {
     return errTool(new Error(`Unknown tool: ${toolName}`));
   }
 
-  
+  private trace(msg: string, meta?: any) {
+    if (process.env.ADVICE_TRACE !== "1") return;
+    const m = meta ? ` ${JSON.stringify(meta)}` : "";
+    this.logger.log(`[AdviceTrace] ${msg}${m}`);
+  }
 
   // ReportService 클래스 안, handleAdviceToolCall 아래에 추가
   // 1) 리턴 타입부터 변경
   private async runAdviceCompletionWithTools(
     baseMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
     trendAreaKeyword: string,
-    onDelta?: (text: string) => void | Promise<void>
-  ): Promise<{ content: string; toolsUsed: string[] }> {
+    onDelta?: (text: string) => void | Promise<void>,
+    onStage?: AdviceStageCb
+  ): Promise<{
+    content: string;
+    toolsUsed: string[];
+    toolMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+  }> {
     const toolsUsed: string[] = [];
 
-    const first = await this.openai.chat.completions.create({
-      model: this.modelName,
-      tools: this.adviceTools,
-      tool_choice: "auto",
-      messages: baseMessages,
+    const TOOL_LIMITS: Record<string, number> = {
+      search_trends: 2,
+      get_rent_info: 1,
+    };
+
+    const MAX_ROUNDS = 3;
+
+    const toolState: ToolState = { counts: {}, memo: {} };
+
+    const allToolMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
+      [];
+
+    let messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+      ...baseMessages,
+    ];
+
+    this.trace("agent_start", {
+      MAX_ROUNDS,
+      TOOL_LIMITS,
+      trendAreaKeyword,
+      baseMessages: baseMessages.length,
     });
 
-    const firstChoice = first.choices[0];
-    if (!firstChoice) {
-      this.logger.warn("[AdviceAgent] first completion returned no choice");
-      return { content: "", toolsUsed };
-    }
+    for (let round = 1; round <= MAX_ROUNDS; round++) {
+      await onStage?.("tool_round", { round });
 
-    const toolCalls = firstChoice.message.tool_calls;
+      this.trace("tool_round_start", {
+        round,
+        messageCount: messages.length,
+        counts: toolState.counts,
+      });
 
-    this.logger.log(
-      `[AdviceAgent] first tool_calls: ${
-        toolCalls
-          ? JSON.stringify(
-              toolCalls.map((tc: any) => ({
-                id: tc.id,
-                type: tc.type,
-                name: tc.function?.name,
-              }))
-            )
-          : "none"
-      }`
-    );
+      const resp = await this.openai.chat.completions.create({
+        model: this.modelName,
+        tools: this.adviceTools,
+        tool_choice: "auto",
+        messages,
+      });
 
-    if (toolCalls && toolCalls.length > 0) {
+      const choice = resp.choices?.[0];
+      const assistantMsg = choice?.message;
+
+      if (!assistantMsg) {
+        this.trace("tool_round_no_assistant_msg", { round });
+        return { content: "", toolsUsed, toolMessages: allToolMessages };
+      }
+
+      messages.push(assistantMsg);
+
+      const toolCalls = assistantMsg.tool_calls ?? [];
+
+      // toolsUsed 기록
       for (const tc of toolCalls as any[]) {
         const fnName = tc.function?.name as string | undefined;
         if (fnName && !toolsUsed.includes(fnName)) toolsUsed.push(fnName);
       }
-    }
 
-    if (!toolCalls || toolCalls.length === 0) {
-      this.logger.log("[AdviceAgent] no tool_calls, return first content");
-      return { content: firstChoice.message.content?.trim() ?? "", toolsUsed };
-    }
+      this.trace("tool_round_resp", {
+        round,
+        finishReason: choice?.finish_reason,
+        toolCalls: (toolCalls as any[]).map((tc) => ({
+          id: tc.id,
+          name: tc.function?.name,
+          argsLen: (tc.function?.arguments ?? "").length,
+        })),
+      });
 
-    const toolMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
-      [];
+      if (toolCalls.length === 0) {
+        this.trace("tool_round_end_no_toolcalls", { round });
+        break;
+      }
 
-    for (const toolCall of toolCalls as any[]) {
-      try {
+      const toolMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
+        [];
+
+      for (const toolCall of toolCalls as any[]) {
+        const toolName: string = toolCall?.function?.name ?? "unknown";
+
+        const nextCount = (toolState.counts[toolName] ?? 0) + 1;
+        toolState.counts[toolName] = nextCount;
+
+        const max = TOOL_LIMITS[toolName] ?? 1;
+
+        this.trace("tool_call_received", {
+          round,
+          toolName,
+          callNo: nextCount,
+          max,
+        });
+
+        // ✅ 상한 초과 처리: search_trends는 best가 있으면 best로 대체 응답
+        if (nextCount > max) {
+          if (toolName === "search_trends") {
+            const best = toolState?.memo?.__search_trends_best;
+
+            if (best && Array.isArray(best.docs) && best.docs.length > 0) {
+              this.trace("tool_call_limit_exceeded_reuse_best", {
+                toolName,
+                callNo: nextCount,
+                max,
+                docs: best.docs.length,
+                cacheKey: best.cacheKey ?? "(memo_best)",
+              });
+
+              toolMessages.push({
+                role: "tool",
+                tool_call_id: toolCall.id,
+                content: JSON.stringify({
+                  ok: true,
+                  tool: toolName,
+                  docs: best.docs ?? [],
+                  cacheHit: true,
+                  memoHit: true,
+                  reusedFrom: "__search_trends_best",
+                  cacheKey: best.cacheKey ?? "(memo_best)",
+                  naverQuery: best.naverQuery,
+                  trendDocsSummary: best.trendDocsSummary,
+                  trendContextText: best.trendContextText,
+                  skipped: true,
+                  reason: "tool_call_limit_exceeded_but_reused_best",
+                  callNo: nextCount,
+                  max,
+                }),
+              });
+              continue;
+            }
+          }
+
+          this.trace("tool_call_limit_exceeded_skip", {
+            toolName,
+            callNo: nextCount,
+            max,
+          });
+
+          toolMessages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({
+              ok: true,
+              tool: toolName,
+              skipped: true,
+              reason: "tool_call_limit_exceeded",
+              callNo: nextCount,
+              max,
+            }),
+          });
+          continue;
+        }
+
         const toolMsg = await this.handleAdviceToolCall(
           toolCall,
-          trendAreaKeyword
+          trendAreaKeyword,
+          toolState
         );
 
-        // ✅ 혹시 handle이 이상하게 빈 값 리턴해도 안전장치
         if (!toolMsg) {
+          this.trace("tool_call_empty_response", { toolName });
+
           toolMessages.push({
             role: "tool",
             tool_call_id: toolCall.id,
             content: JSON.stringify({
               ok: false,
-              tool: toolCall.function?.name ?? "unknown",
+              tool: toolName,
               error: "tool returned empty response",
             }),
           });
         } else {
+          // ✅ tool 응답 요약 로그(너무 크면 위험 → 길이만)
+          const c =
+            typeof toolMsg.content === "string"
+              ? toolMsg.content
+              : JSON.stringify(toolMsg.content);
+          this.trace("tool_call_done", {
+            toolName,
+            contentLen: c.length,
+          });
+
           toolMessages.push(toolMsg);
         }
-      } catch (e: any) {
-        this.logger.error(
-          `[AdviceAgent] tool execution error: ${toolCall.type}/${toolCall.id}`,
-          e?.stack ?? e
-        );
-
-        // ✅ 핵심: 실패해도 tool_call_id에 대한 tool 응답은 반드시 넣는다
-        toolMessages.push({
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: JSON.stringify({
-            ok: false,
-            tool: toolCall.function?.name ?? "unknown",
-            error: e?.message ?? String(e),
-          }),
-        });
       }
+
+      messages = [...messages, ...toolMessages];
+      allToolMessages.push(...toolMessages);
+
+      this.trace("tool_round_end", {
+        round,
+        addedTools: toolMessages.length,
+        totalToolMsgs: allToolMessages.length,
+      });
     }
 
-    // ✅ 2차 호출: stream:true
+    // ✅ 마지막: “최종 답변만” 스트리밍 (도구 금지)
+    await onStage?.("final_stream");
+
+    this.trace("final_stream_start", {
+      messageCount: messages.length,
+      toolsUsed,
+    });
+
     const stream = await this.openai.chat.completions.create({
       model: this.modelName,
       tools: this.adviceTools,
       tool_choice: "none",
-      stream: true, // ✅ 추가
+      stream: true,
       messages: [
-        ...baseMessages,
-        firstChoice.message, // tool_calls 포함된 assistant 메시지
-        ...toolMessages, // tool_call_id 전부 대응됨
+        ...messages,
+        {
+          role: "system",
+          content:
+            "이제 도구 호출 없이, 위 근거를 반영해서 1~7 섹션 형식으로 최종 조언만 작성해라.",
+        },
       ],
     });
 
-    // ✅ delta 누적 + 실시간 콜백
     let full = "";
     let buf = "";
     let lastFlush = Date.now();
     const FLUSH_MS = 80;
+
+    // ✅ 스트림 로그(스팸 방지): 1초에 1번 정도만 길이 찍기
+    let lastStreamLogAt = 0;
 
     const flush = async (force = false) => {
       const now = Date.now();
@@ -586,16 +892,399 @@ export class ReportService {
         full += delta;
         buf += delta;
         await flush(false);
+
+        if (process.env.ADVICE_TRACE === "1") {
+          const now = Date.now();
+          if (now - lastStreamLogAt > 1000) {
+            lastStreamLogAt = now;
+            this.logger.log(
+              `[AdviceTrace] stream_progress len=${full.length} buf=${buf.length}`
+            );
+          }
+        }
       }
     }
     await flush(true);
 
-    // 스트리밍인데 아무 것도 안 왔다면(매우 드묾) fallback
-    if (!full.trim()) {
-      this.logger.warn("[AdviceAgent] stream finished but no content");
+    this.trace("final_stream_end", { finalLen: full.trim().length });
+
+    return { content: full.trim(), toolsUsed, toolMessages: allToolMessages };
+  }
+
+  private async finalizeAdviceMarkdown(params: {
+    finalMarkdown: string;
+    evidenceText: string; // toolEvidence든 server-agent evidence든
+    citations: Citation[]; // 최소 1개 보장 목표
+    onStage?: AdviceStageCb;
+  }): Promise<string> {
+    const extractJsonObject = (s: string) => {
+      const start = s.indexOf("{");
+      const end = s.lastIndexOf("}");
+      if (start === -1 || end === -1 || end <= start) return null;
+      return s.slice(start, end + 1);
+    };
+
+    const sanitizeMarkdown = (md: string) =>
+      md.replace(/[\u3040-\u30ff]/g, "").replace(/~~/g, "");
+
+    const citations =
+      params.citations && params.citations.length > 0
+        ? params.citations
+        : [{ source: "internal_db" }];
+
+    const draftObj = {
+      version: "v1",
+      title: "AI 상권 리포트",
+      markdown: params.finalMarkdown.trim(),
+      citations,
+      warnings: [] as string[],
+    };
+
+    const v0 = validateAdviceOutput(draftObj);
+    if (v0.ok) return v0.value.markdown.trim();
+
+    await params.onStage?.("finalizing", { reason: v0.reason });
+
+    const packPrompt: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+      {
+        role: "system",
+        content: `
+  너는 출력 포맷터다.
+  아래 스키마를 만족하는 "순수 JSON"만 출력해라. (코드블록/설명 금지)
+  
+  스키마:
+  {
+    "version": "v1",
+    "title": string,
+    "markdown": string,
+    "citations": [{"source": string, "url"?: string, "quote"?: string}],
+    "warnings": string[]
+  }
+  
+  제약:
+  - citations는 최소 1개 이상.
+  - markdown에는 일본어 가나(히라가나/가타카나) 포함 금지.
+  - markdown에는 "~~" 포함 금지.
+  - markdown은 입력 내용을 가능한 한 유지하되, 규칙 위반 요소만 제거/수정.
+  `.trim(),
+      },
+      {
+        role: "user",
+        content: `
+  [입력 마크다운]
+  ${params.finalMarkdown}
+  
+  [근거 후보]
+  ${params.evidenceText}
+  
+  위 두 정보를 바탕으로 citations를 최소 1개 이상 구성해라.
+  근거 후보에서 URL/문장이 있으면 quote/url로 써라.
+  URL/문장이 없으면 source는 "internal_db"로 두고 quote는 생략해도 된다.
+  `.trim(),
+      },
+    ];
+
+    const r = await this.openai.chat.completions.create({
+      model: this.modelName,
+      messages: packPrompt,
+      temperature: 0,
+    });
+
+    const raw = r.choices?.[0]?.message?.content ?? "";
+    const jsonText = extractJsonObject(raw) ?? raw;
+
+    let obj: any;
+    try {
+      obj = JSON.parse(jsonText);
+    } catch {
+      return sanitizeMarkdown(params.finalMarkdown.trim());
     }
 
-    return { content: full.trim(), toolsUsed };
+    const v1 = validateAdviceOutput(obj);
+    if (v1.ok) return v1.value.markdown.trim();
+
+    // 1회 repair
+    const repair = await this.openai.chat.completions.create({
+      model: this.modelName,
+      messages: [
+        {
+          role: "system",
+          content: `너는 JSON修正기다. 오직 "순수 JSON"만 출력해라.`,
+        },
+        {
+          role: "user",
+          content: `
+  아래 JSON이 검증에 실패했다.
+  실패 사유: ${v1.reason}
+  
+  스키마/제약을 만족하도록 JSON만 고쳐서 다시 출력해라.
+  (코드블록/설명 금지)
+  
+  [실패 JSON]
+  ${jsonText}
+  `.trim(),
+        },
+      ],
+      temperature: 0,
+    });
+
+    const repairRaw = repair.choices?.[0]?.message?.content ?? "";
+    const repairJsonText = extractJsonObject(repairRaw) ?? repairRaw;
+
+    try {
+      const repairedObj = JSON.parse(repairJsonText);
+      const v2 = validateAdviceOutput(repairedObj);
+      if (v2.ok) return v2.value.markdown.trim();
+    } catch {}
+
+    return sanitizeMarkdown(params.finalMarkdown.trim());
+  }
+
+  private async finalizeAdviceOutput(
+    markdown: string,
+    toolMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    onStage?: AdviceStageCb
+  ): Promise<string> {
+    const extractJsonObject = (s: string) => {
+      const start = s.indexOf("{");
+      const end = s.lastIndexOf("}");
+      if (start === -1 || end === -1 || end <= start) return null;
+      return s.slice(start, end + 1);
+    };
+
+    const sanitizeMarkdown = (md: string) =>
+      md.replace(/[\u3040-\u30ff]/g, "").replace(/~~/g, "");
+
+    type Citation = { source: string; url?: string; quote?: string };
+
+    const buildCitationsFromToolMessages = (
+      msgs: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
+    ): Citation[] => {
+      const citations: Citation[] = [];
+
+      for (const m of msgs) {
+        const content =
+          typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+
+        let obj: any = null;
+        try {
+          obj = JSON.parse(content);
+        } catch {
+          continue;
+        }
+        if (!obj || obj.ok !== true) continue;
+
+        if (obj.tool === "search_trends" && Array.isArray(obj.docs)) {
+          for (const d of obj.docs.slice(0, 3)) {
+            const source =
+              String(d?.source ?? "naver_blog").trim() || "naver_blog";
+            const url =
+              typeof d?.url === "string" && d.url.trim() ? d.url : undefined;
+            const quoteRaw =
+              typeof d?.content === "string"
+                ? d.content
+                : typeof d?.text === "string"
+                ? d.text
+                : "";
+            const quote = quoteRaw.trim().slice(0, 180) || undefined;
+
+            citations.push({ source, url, quote });
+          }
+        }
+
+        if (obj.tool === "get_rent_info" && obj.rent) {
+          const dongName = typeof obj.dongName === "string" ? obj.dongName : "";
+          citations.push({
+            source: "rent_info",
+            quote: dongName
+              ? `${dongName} 임대/매매 요약 데이터 참조`
+              : "임대/매매 요약 데이터 참조",
+          });
+        }
+      }
+
+      if (citations.length === 0) citations.push({ source: "internal_db" });
+      return citations;
+    };
+
+    // 1) 1차: “이미 스키마 만족”하면 pack 없이 끝
+    const draftObj = {
+      version: "v1",
+      title: "AI 상권 리포트",
+      markdown: markdown.trim(),
+      citations: buildCitationsFromToolMessages(toolMessages),
+      warnings: [] as string[],
+    };
+
+    const v0 = validateAdviceOutput(draftObj);
+    if (v0.ok) return v0.value.markdown.trim();
+
+    await onStage?.("finalizing", { reason: v0.reason });
+
+    // tool evidence 문자열
+    const toolEvidence = toolMessages
+      .map((m) =>
+        typeof m.content === "string" ? m.content : JSON.stringify(m.content)
+      )
+      .join("\n\n");
+
+    // 2) pack 1회 + validate
+    const packPrompt: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+      {
+        role: "system",
+        content: `
+  너는 출력 포맷터다.
+  아래 스키마를 만족하는 "순수 JSON"만 출력해라. (코드블록/설명 금지)
+  
+  스키마:
+  {
+    "version": "v1",
+    "title": string,
+    "markdown": string,
+    "citations": [{"source": string, "url"?: string, "quote"?: string}],
+    "warnings": string[]
+  }
+  
+  제약:
+  - citations는 최소 1개 이상.
+  - markdown에는 일본어 가나(히라가나/가타카나) 포함 금지.
+  - markdown에는 "~~" 포함 금지.
+  - markdown은 입력 내용을 가능한 한 유지하되, 규칙 위반 요소만 제거/수정.
+  `.trim(),
+      },
+      {
+        role: "user",
+        content: `
+  [입력 마크다운]
+  ${markdown}
+  
+  [도구 결과(근거 후보)]
+  ${toolEvidence}
+  
+  위 두 정보를 바탕으로 citations를 최소 1개 이상 구성해라.
+  URL/문장이 있으면 quote/url로 써라.
+  없으면 source는 "internal_db"로 두어도 된다.
+  `.trim(),
+      },
+    ];
+
+    const r = await this.openai.chat.completions.create({
+      model: this.modelName,
+      messages: packPrompt,
+      temperature: 0,
+    });
+
+    const raw = r.choices?.[0]?.message?.content ?? "";
+    const jsonText = extractJsonObject(raw) ?? raw;
+
+    let obj: any;
+    try {
+      obj = JSON.parse(jsonText);
+    } catch {
+      return sanitizeMarkdown(markdown.trim());
+    }
+
+    const v1 = validateAdviceOutput(obj);
+    if (v1.ok) return v1.value.markdown.trim();
+
+    // 3) repair 1회
+    const repair = await this.openai.chat.completions.create({
+      model: this.modelName,
+      messages: [
+        {
+          role: "system",
+          content: `너는 JSON修正기다. 오직 "순수 JSON"만 출력해라.`,
+        },
+        {
+          role: "user",
+          content: `
+  아래 JSON이 검증에 실패했다.
+  실패 사유: ${v1.reason}
+  
+  스키마/제약을 만족하도록 JSON만 고쳐서 다시 출력해라.
+  (코드블록/설명 금지)
+  
+  [실패 JSON]
+  ${jsonText}
+  `.trim(),
+        },
+      ],
+      temperature: 0,
+    });
+
+    const repairRaw = repair.choices?.[0]?.message?.content ?? "";
+    const repairJsonText = extractJsonObject(repairRaw) ?? repairRaw;
+
+    try {
+      const repairedObj = JSON.parse(repairJsonText);
+      const v2 = validateAdviceOutput(repairedObj);
+      if (v2.ok) return v2.value.markdown.trim();
+    } catch {
+      // ignore
+    }
+
+    // 4) 최후 fallback
+    return sanitizeMarkdown(markdown.trim());
+  }
+
+  private traceEvidenceUsedLite(
+    finalMarkdown: string,
+    toolMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
+  ) {
+    if (process.env.ADVICE_TRACE !== "1") return;
+
+    let trendDocs: any[] = [];
+    let naverQuery = "";
+    let rentHasData = false;
+    let rentDong = "";
+
+    for (const m of toolMessages) {
+      const content =
+        typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      let obj: any;
+      try {
+        obj = JSON.parse(content);
+      } catch {
+        continue;
+      }
+      if (!obj || obj.ok !== true) continue;
+
+      if (obj.tool === "search_trends") {
+        trendDocs = Array.isArray(obj.docs) ? obj.docs : [];
+        naverQuery = typeof obj.naverQuery === "string" ? obj.naverQuery : "";
+      }
+      if (obj.tool === "get_rent_info") {
+        rentHasData = !!obj.rent;
+        rentDong = typeof obj.dongName === "string" ? obj.dongName : "";
+      }
+    }
+
+    // 트렌드 키워드(한글 2글자 이상) 몇 개 뽑아서 답변에 포함됐는지 확인
+    const text = trendDocs
+      .slice(0, 3)
+      .map((d) => String(d?.content ?? d?.text ?? ""))
+      .join(" ");
+    const keywords = Array.from(new Set(text.match(/[가-힣]{2,}/g) ?? []))
+      .filter((w) => w.length >= 2)
+      .slice(0, 12);
+
+    const hits = keywords.filter((k) => finalMarkdown.includes(k)).slice(0, 8);
+
+    const hasTrendSentence = finalMarkdown.includes("최근 온라인 트렌드에서는");
+    const hasRentSentence = finalMarkdown.includes("임대/매매 관점에서는");
+
+    this.logger.log(
+      `[AdviceTrace] evidence_check ` +
+        `trend.docs=${trendDocs.length} trend.naverQuery="${naverQuery}" ` +
+        `rent.hasData=${rentHasData} rent.dong="${rentDong}"`
+    );
+    this.logger.log(
+      `[AdviceTrace] evidence_used ` +
+        `requiredTrendSentence=${hasTrendSentence} requiredRentSentence=${hasRentSentence} ` +
+        `trend.keywordHit=${hits.length}/${keywords.length} hits=${hits.join(
+          ","
+        )}`
+    );
   }
 
   // GET /report?dongId=1 에서 쓸 핵심 함수
@@ -697,44 +1386,6 @@ export class ReportService {
     return result;
   }
 
-  private makeRagCacheKey(params: {
-    dongId: number;
-    concept: string;
-    budgetLevel: string;
-    targetAge: string;
-    openHours: string;
-  }) {
-    const { dongId, concept, budgetLevel, targetAge, openHours } = params;
-
-    // key는 최대한 deterministic 하게
-    return [
-      "rag",
-      `dong:${dongId}`,
-      `concept:${concept}`,
-      `budget:${budgetLevel}`,
-      `age:${targetAge}`,
-      `hours:${openHours}`,
-    ].join("|");
-  }
-
-  private makeNaverQueryCacheKey(ragKey: string) {
-    // ragKey에서 파생
-    return `naverQuery|${ragKey}`;
-  }
-
-  private async getCacheJson<T>(key: string): Promise<T | null> {
-    const raw = await this.redis.get(key);
-    if (!raw) return null;
-    try {
-      return JSON.parse(raw) as T;
-    } catch {
-      return null;
-    }
-  }
-
-  private async setCacheJson<T>(key: string, value: T, ttlSec: number) {
-    await this.redis.set(key, JSON.stringify(value), "EX", ttlSec);
-  }
   // src/modules/report/report.service.ts 안에
 
   async generateReportText(report: ReportResponse): Promise<string> {
@@ -908,18 +1559,9 @@ ${reportJson}
     report: ReportResponse,
     options: AdviceOptions,
     question: string,
-    onDelta?: (text: string) => void | Promise<void>
+    onDelta?: (text: string) => void | Promise<void>,
+    onStage?: AdviceStageCb
   ): Promise<string> {
-    const dongId = report.dong.id;
-    const openHours = options.openHours ?? "저녁 시간대 중심";
-
-    const ragKey = this.makeRagCacheKey({
-      dongId,
-      concept: options.concept,
-      budgetLevel: options.budgetLevel,
-      targetAge: options.targetAge,
-      openHours,
-    });
     const endTotal = perfTimer("generateAdvice TOTAL");
 
     // 세부 타이머들은 try 안/밖 상관없이 “끝내는 함수”를 확보
@@ -970,90 +1612,7 @@ ${reportJson}
 
       const trendAreaKeyword = normalizeTrendArea(adminDongName);
 
-      // RAG 기본값
-      let trendContextText = "트렌드 관련 참고 텍스트가 충분하지 않습니다.";
-      let trendDocsSummary =
-        "관련된 트렌드 참고 텍스트를 충분히 찾지 못했습니다.";
-
       endPre();
-
-      // --- 2) RAG 전용 try/catch ---
-      try {
-        const cached = await this.redis.get(ragKey);
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          trendContextText = parsed.trendContextText ?? "";
-          trendDocsSummary = parsed.trendDocsSummary ?? "";
-          this.logger.log(`[CACHE HIT] ragKey=${ragKey}`);
-        } else {
-          this.logger.log(`[CACHE MISS] ragKey=${ragKey}`);
-
-          const endQueryLLM = perfTimer("RAG: buildNaverQueryWithLLM");
-          let naverQuery =
-            (await buildNaverQueryWithLLM(
-              this.openai,
-              this.modelName,
-              safeQuestion,
-              trendAreaKeyword,
-              this.logger
-            )) || "";
-          endQueryLLM();
-
-          const endQueryFallback = perfTimer("RAG: fallback");
-          if (!naverQuery) {
-            naverQuery = buildNaverQueryFromQuestion(
-              safeQuestion,
-              trendAreaKeyword
-            );
-          }
-          endQueryFallback();
-
-          const endNaver = perfTimer("RAG: naver searchBlogs");
-          const blogResult = await this.naverBlogService.searchBlogs(
-            naverQuery
-          );
-          endNaver();
-
-          const endSave = perfTimer("RAG: saveFromNaverBlogs");
-          if (trendAreaKeyword && blogResult.items?.length) {
-            this.ragSaveQueue.add("save-trend-docs", {
-              trendAreaKeyword,
-              items: blogResult.items,
-            });
-          }
-          endSave();
-
-          const endHybrid = perfTimer("RAG: searchHybrid");
-          const trendDocs = await this.trendDocsService.searchHybrid(
-            safeQuestion,
-            5,
-            20,
-            trendAreaKeyword
-          );
-          endHybrid();
-
-          if (trendDocs?.length) {
-            trendDocsSummary = trendDocs
-              .slice(0, 3)
-              .map((d, i) => `(${i + 1}) [source: ${d.source}] ${d.content}`)
-              .join("\n");
-
-            trendContextText = trendDocs
-              .map((d, i) => `#${i + 1} [${d.source}]\n${d.content}`)
-              .join("\n\n---\n\n");
-          }
-          await this.redis.set(
-            ragKey,
-            JSON.stringify({ trendContextText, trendDocsSummary }),
-            "EX",
-            60 * 30
-          );
-        }
-      } catch (e) {
-        console.warn("RAG 오류 → DB 데이터 위주로 조언합니다:", e);
-        trendContextText =
-          "트렌드 검색 중 오류가 발생하여, 저장된 트렌드 텍스트를 활용하지 못했습니다.";
-      }
 
       // --- 3) 최종 LLM (tool-calling 엔진 사용) ---
       endFinalLLM = perfTimer("LLM: advice completion");
@@ -1275,15 +1834,24 @@ ${reportJson}
           },
         ];
 
-      const { content, toolsUsed } = await this.runAdviceCompletionWithTools(
-        baseMessages,
-        trendAreaKeyword,
-        onDelta
-      );
+      const { content, toolsUsed, toolMessages } =
+        await this.runAdviceCompletionWithTools(
+          baseMessages,
+          trendAreaKeyword,
+          onDelta,
+          onStage
+        );
 
       endFinalLLM();
 
-      return content;
+      const finalMarkdown = await this.finalizeAdviceOutput(
+        content,
+        toolMessages,
+        onStage
+      );
+      this.traceEvidenceUsedLite(finalMarkdown, toolMessages);
+
+      return finalMarkdown;
     } finally {
       // ✅ 어떤 return/throw가 나도 TOTAL은 무조건 종료
       endTotal();

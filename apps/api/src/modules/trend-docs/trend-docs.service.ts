@@ -30,18 +30,18 @@ export class TrendDocsService {
     private readonly openai: OpenAI
   ) {}
 
-  async embedText(text: string): Promise<string> {
+  async embedText(text: string, delayMs = 5): Promise<string> {
     if (isPerfFakeLLM()) {
-      // DB 저장 시간만 측정
-      await delay(5);
+      // DB 저장 시간만 측정 (호출부에서 delayMs 조절 가능)
+      await delay(delayMs);
       return `[${new Array(1536).fill("0").join(",")}]`;
     }
-
+  
     const emb = await this.openai.embeddings.create({
       model: "text-embedding-3-small",
       input: text,
     });
-
+  
     const vector = emb.data[0].embedding;
     return `[${vector.join(",")}]`;
   }
@@ -105,20 +105,7 @@ export class TrendDocsService {
       }
     }
 
-    let vectorString: string;
-
-    if (isPerfFakeLLM()) {
-      // embedding fake: 1536차원 0벡터
-      await delay(20);
-      vectorString = `[${Array(1536).fill(0).join(",")}]`;
-    } else {
-      const emb = await this.openai.embeddings.create({
-        model: "text-embedding-3-small",
-        input: dto.content,
-      });
-      const vector = emb.data[0].embedding;
-      vectorString = `[${vector.join(",")}]`;
-    }
+    const vectorString = await this.embedText(dto.content, 20);
 
     const doc = this.repo.create({
       source: dto.source,

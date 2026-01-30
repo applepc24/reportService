@@ -82,6 +82,8 @@ export class AdviceWorker implements OnModuleInit, OnModuleDestroy {
             options,
             question,
             async (deltaText) => {
+              if (!deltaText) return; // ✅ 안전장치 (빈 delta 방지)
+
               seq += 1;
 
               const msg = JSON.stringify({
@@ -91,11 +93,14 @@ export class AdviceWorker implements OnModuleInit, OnModuleDestroy {
 
               await this.redis
                 .multi()
-                .append(textKey, deltaText) // ✅ 누적 텍스트 저장
-                .set(seqKey, String(seq), "EX", TTL) // ✅ 마지막 seq 저장
-                .set(lastKey, msg, "EX", TTL) // ✅ 마지막 이벤트 저장
-                .publish(channel, msg) // ✅ SSE로 흘릴 실시간 이벤트
+                .append(textKey, deltaText)
+                .set(seqKey, String(seq), "EX", TTL)
+                .set(lastKey, msg, "EX", TTL)
+                .publish(channel, msg)
                 .exec();
+            },
+            async (stage, meta) => {
+              await pub("progress", { stage, ...(meta ?? {}) });
             }
           );
           await pub("progress", { stage: "generate_advice_done" });
