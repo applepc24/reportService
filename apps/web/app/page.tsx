@@ -48,7 +48,7 @@ const TARGET_AGES = [
 ];
 
 export default function Home() {
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "https://api.snapreport.cloud";
+  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "https://api.snapreport.cloud";
 
   const [step, setStep] = useState(0);
   const [_selectedDistrict, setSelectedDistrict] = useState("");

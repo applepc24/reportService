@@ -1,14 +1,8 @@
 function getApiBase() {
-  const isServer = typeof window === "undefined";
-  if (isServer) {
-    // SSR/빌드/서버액션에서는 절대주소 필요
-    return process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000";
-  }
-  return "/api";
+  return process.env.NEXT_PUBLIC_API_BASE_URL || "https://api.snapreport.cloud";
 }
 
 const API_BASE = getApiBase();
-
 export type AdviceRequest = {
   dongId: number;
   budgetLevel: string;
