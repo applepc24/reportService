@@ -1,5 +1,11 @@
 function getApiBase() {
-  return process.env.NEXT_PUBLIC_API_BASE_URL || "https://api.snapreport.cloud";
+  const isServer = typeof window === "undefined";
+  if (isServer) {
+    // 서버(SSR/빌드)에서는 절대주소 OK
+    return process.env.NEXT_PUBLIC_API_BASE_URL ?? "https://api.snapreport.cloud";
+  }
+  // ✅ 브라우저는 무조건 same-origin /api
+  return "/api";
 }
 
 const API_BASE = getApiBase();

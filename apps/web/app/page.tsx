@@ -49,6 +49,8 @@ const TARGET_AGES = [
 
 export default function Home() {
 
+  const API_BASE = "/api";
+
   const [step, setStep] = useState(0);
   const [_selectedDistrict, setSelectedDistrict] = useState("");
   const [selectedDongId, setSelectedDongId] = useState<number | null>(null);
