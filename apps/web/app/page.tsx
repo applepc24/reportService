@@ -48,7 +48,6 @@ const TARGET_AGES = [
 ];
 
 export default function Home() {
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "https://api.snapreport.cloud";
 
   const [step, setStep] = useState(0);
   const [_selectedDistrict, setSelectedDistrict] = useState("");
@@ -129,7 +128,7 @@ export default function Home() {
     closeStream();
 
     // 브라우저에서는 API_BASE가 "/api"였지? SSE도 동일하게 프록시로 태우자
-    const url = `${API_BASE}/report/advice/${jid}/stream`;
+    const url = `/api/report/advice/${jid}/stream`;
     const es = new EventSource(url);
     esRef.current = es;
 
@@ -219,7 +218,7 @@ export default function Home() {
     const handler = setTimeout(async () => {
       try {
         const res = await fetch(
-          `${API_BASE}/dong/search?q=${encodeURIComponent(searchQuery)}`
+          `/api/dong/search?q=${encodeURIComponent(searchQuery)}`
         );
         const data: DongOption[] = await res.json();
         setDongOptions(data);
@@ -296,7 +295,7 @@ export default function Home() {
     // 2) 백엔드: best-effort cancel (엔드포인트 없으면 이 부분은 나중에)
     if (!jobId) return;
     try {
-      await fetch(`${API_BASE}/report/advice/${jobId}/cancel`, { method: "POST" });
+      await fetch(`/api/report/advice/${jobId}/cancel`, { method: "POST" });
     } catch {
       // cancel이 아직 없거나 실패해도 UX는 "멈춤" 유지
     }

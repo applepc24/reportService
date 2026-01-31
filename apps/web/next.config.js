@@ -3,7 +3,7 @@ const isDev = process.env.NODE_ENV !== "production";
 
 const nextConfig = {
   async rewrites() {
-    // dev에서만 /api 프록시 사용 (로컬 개발 편의)
+    // ✅ dev: 로컬 API로
     if (isDev) {
       return [
         {
@@ -13,8 +13,13 @@ const nextConfig = {
       ];
     }
 
-    // production에서는 /api 프록시를 끈다 (Vercel 502 방지)
-    return [];
+    // ✅ prod: api.snapreport.cloud로
+    return [
+      {
+        source: "/api/:path*",
+        destination: "https://api.snapreport.cloud/:path*",
+      },
+    ];
   },
 };
 
