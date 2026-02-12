@@ -16,7 +16,7 @@
 ---
 
 ## Demo
-- https://report-service-ebon.vercel.app/
+- snapreport.cloud
 - API Health: `GET /health`
 
 **Quick Try**
@@ -246,6 +246,7 @@ cd apps/web
 cp .env.example .env
 npm install
 npm run dev
+
 
 
 
